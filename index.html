@@ -1,0 +1,2749 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>天気図スタジオ — Weather Chart Studio</title>
+    <meta
+      name="description"
+      content="日本周辺の地図を背景に、等圧線や各種前線、高気圧・低気圧スタンプをレイヤーで描画し、編集履歴の復元や画像保存ができる天気図作成アプリ"
+    />
+    <meta property="og:title" content="天気図スタジオ — Weather Chart Studio" />
+    <meta
+      property="og:description"
+      content="日本周辺の地図を背景に、等圧線や各種前線、高気圧・低気圧スタンプをレイヤーで描画し、編集履歴の復元や画像保存ができる天気図作成アプリ"
+    />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/topojson-client@3/dist/topojson-client.min.js"></script>
+    <style>
+      :root {
+        --font-sans: "IBM Plex Sans JP", "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+        --font-display: "Plus Jakarta Sans", "IBM Plex Sans JP", sans-serif;
+        --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      html, body, #root {
+        height: 100%;
+        font-family: var(--font-sans);
+      }
+      .font-display { font-family: var(--font-display); }
+      .font-mono-tabular {
+        font-family: var(--font-mono);
+        font-variant-numeric: tabular-nums;
+      }
+      ::-webkit-scrollbar { width: 6px; height: 6px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.4); border-radius: 3px; }
+      ::-webkit-scrollbar-thumb:hover { background: rgba(100, 116, 139, 0.6); }
+    </style>
+  </head>
+  <body class="bg-slate-50 text-slate-900 antialiased selection:bg-sky-100 selection:text-sky-900">
+    <div id="root"></div>
+    <script type="text/babel">
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+// === 1. Map Projection & East Asia Geometry ===
+const CHART_WIDTH = 1200;
+const CHART_HEIGHT = 900;
+const LON_CENTER = 137.5;
+const LAT_REF = 36.0;
+const PROJECTION_R = 2320;
+const ORIGIN_X = CHART_WIDTH * 0.51;
+const R_REF = PROJECTION_R * Math.tan(Math.PI / 4 - (LAT_REF * Math.PI) / 360);
+const ORIGIN_Y = CHART_HEIGHT * 0.52 - R_REF;
+const DEG_TO_RAD = Math.PI / 180;
+const RAD_TO_DEG = 180 / Math.PI;
+
+function projectLonLat(lon, lat) {
+  const clampedLat = Math.max(-60, Math.min(89.5, lat));
+  const phi = clampedLat * DEG_TO_RAD;
+  const lambda = (lon - LON_CENTER) * DEG_TO_RAD;
+  const r = PROJECTION_R * Math.tan(Math.PI / 4 - phi / 2);
+  return { x: ORIGIN_X + r * Math.sin(lambda), y: ORIGIN_Y + r * Math.cos(lambda) };
+}
+
+function unprojectXY(x, y) {
+  const dx = x - ORIGIN_X;
+  const dy = y - ORIGIN_Y;
+  const r = Math.sqrt(dx * dx + dy * dy);
+  const lambda = Math.atan2(dx, dy);
+  const phi = Math.PI / 2 - 2 * Math.atan(r / PROJECTION_R);
+  let lon = LON_CENTER + lambda * RAD_TO_DEG;
+  if (lon > 180) lon -= 360;
+  if (lon < -180) lon += 360;
+  return { lon, lat: phi * RAD_TO_DEG };
+}
+
+const REFERENCE_CITIES = [
+  { name: '札幌', lon: 141.35, lat: 43.06, isMajor: true },
+  { name: '仙台', lon: 140.87, lat: 38.27 },
+  { name: '東京', lon: 139.77, lat: 35.68, isMajor: true },
+  { name: '名古屋', lon: 136.91, lat: 35.18 },
+  { name: '大阪', lon: 135.5, lat: 34.69, isMajor: true },
+  { name: '広島', lon: 132.46, lat: 34.39 },
+  { name: '福岡', lon: 130.4, lat: 33.59, isMajor: true },
+  { name: '鹿児島', lon: 130.56, lat: 31.6 },
+  { name: '那覇', lon: 127.68, lat: 26.21, isMajor: true },
+  { name: 'ソウル', lon: 126.98, lat: 37.57 },
+  { name: '台北', lon: 121.56, lat: 25.03 },
+  { name: '上海', lon: 121.47, lat: 31.23 },
+  { name: 'ウラジオストク', lon: 131.89, lat: 43.12 },
+].map((c) => ({ ...c, ...projectLonLat(c.lon, c.lat) }));
+
+function ringIntersectsChart(ring) {
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (let i = 0; i < ring.length; i++) {
+    const [lon, lat] = ring[i];
+    if (lat < -5 || lat > 80) continue;
+    const pt = projectLonLat(lon, lat);
+    if (pt.x < minX) minX = pt.x;
+    if (pt.x > maxX) maxX = pt.x;
+    if (pt.y < minY) minY = pt.y;
+    if (pt.y > maxY) maxY = pt.y;
+  }
+  const margin = 120;
+  return maxX >= -margin && minX <= CHART_WIDTH + margin && maxY >= -margin && minY <= CHART_HEIGHT + margin;
+}
+
+function projectRing(ring) {
+  const arr = new Float32Array(ring.length * 2);
+  for (let i = 0; i < ring.length; i++) {
+    const pt = projectLonLat(ring[i][0], ring[i][1]);
+    arr[i * 2] = pt.x;
+    arr[i * 2 + 1] = pt.y;
+  }
+  return { points: arr };
+}
+
+const FALLBACK_LAND_COORDS = [
+  [[140.1,41.4],[139.8,42.3],[140.5,43.3],[141.3,44.4],[141.9,45.5],[143.3,44.3],[145.3,43.4],[144.4,42.9],[143.2,42.0],[141.7,42.6],[140.7,41.8],[140.1,41.4]],
+  [[140.9,41.5],[141.5,40.4],[142.0,39.4],[141.4,38.3],[140.9,37.1],[140.9,35.7],[139.8,35.1],[138.8,34.7],[136.9,34.6],[135.8,33.5],[135.1,34.2],[133.9,34.4],[131.0,34.0],[131.8,34.8],[133.2,35.5],[135.2,35.7],[136.7,36.8],[137.4,37.5],[139.0,38.0],[140.0,39.7],[140.3,41.1],[140.9,41.5]],
+  [[132.1,33.4],[133.5,34.0],[134.7,34.2],[134.3,33.2],[133.0,32.8],[132.1,33.4]],
+  [[130.9,33.9],[131.8,33.2],[131.4,31.4],[130.6,31.1],[130.1,32.2],[129.6,33.2],[130.9,33.9]],
+  [[127.6,26.1],[128.3,26.8],[127.9,26.1],[127.6,26.1]],
+  [[120.2,22.0],[121.0,22.8],[121.9,25.1],[121.0,25.1],[120.1,23.5],[120.2,22.0]],
+  [[105.0,55.0],[135.0,55.0],[141.0,53.0],[140.0,49.0],[136.0,45.0],[132.0,43.0],[129.4,41.0],[129.1,35.1],[126.4,34.6],[126.1,37.6],[124.2,39.9],[121.1,38.8],[118.5,39.0],[122.4,37.3],[119.5,34.5],[121.9,31.2],[120.8,28.0],[117.5,23.8],[113.5,22.1],[108.0,21.5],[105.0,22.0],[105.0,55.0]],
+  [[142.0,46.0],[143.5,46.8],[143.0,50.5],[142.8,54.2],[141.8,53.5],[142.0,46.0]],
+  [[156.5,51.0],[158.5,53.0],[162.0,56.0],[155.0,56.0],[156.5,51.0]],
+];
+
+let cachedGeometry = {
+  landRings: FALLBACK_LAND_COORDS.map(projectRing),
+  borderLines: [],
+};
+
+function buildGeometryFromTopology(topology) {
+  if (!window.topojson) return null;
+  const landGeo = window.topojson.feature(topology, topology.objects.land);
+  const landRings = [];
+  const extractRings = (coords) => {
+    for (const ring of coords) {
+      if (ring.length >= 3 && ringIntersectsChart(ring)) landRings.push(projectRing(ring));
+    }
+  };
+  if (landGeo.type === 'FeatureCollection') {
+    for (const f of landGeo.features) {
+      if (!f.geometry) continue;
+      if (f.geometry.type === 'Polygon') extractRings(f.geometry.coordinates);
+      else if (f.geometry.type === 'MultiPolygon') {
+        for (const poly of f.geometry.coordinates) extractRings(poly);
+      }
+    }
+  }
+  const borderMesh = window.topojson.mesh(topology, topology.objects.countries, (a, b) => a !== b);
+  const borderLines = [];
+  if (borderMesh.type === 'MultiLineString') {
+    for (const line of borderMesh.coordinates) {
+      if (line.length >= 2 && ringIntersectsChart(line)) borderLines.push(projectRing(line));
+    }
+  }
+  return { landRings, borderLines };
+}
+
+// === 2. Weather Chart Renderer ===
+const MAP_THEMES = {
+  broadcast: {
+    ocean: '#E4F1FA', land: '#DCE9D5', coastline: '#5E7C68', border: '#7C9885',
+    grid: 'rgba(51, 102, 153, 0.18)', gridText: '#476E8E', cityDot: '#334155', cityText: '#1E293B',
+    isobarDefault: '#1E293B', labelHalo: 'rgba(255, 255, 255, 0.92)', frameBg: '#F8FAFC',
+    frameBorder: '#CBD5E1', headerBg: 'rgba(255, 255, 255, 0.92)', headerText: '#0F172A',
+  },
+  jma_classic: {
+    ocean: '#F8FAFC', land: '#E2E8F0', coastline: '#475569', border: '#94A3B8',
+    grid: 'rgba(100, 116, 139, 0.2)', gridText: '#64748B', cityDot: '#334155', cityText: '#334155',
+    isobarDefault: '#0F172A', labelHalo: 'rgba(248, 250, 252, 0.94)', frameBg: '#FFFFFF',
+    frameBorder: '#CBD5E1', headerBg: 'rgba(255, 255, 255, 0.94)', headerText: '#0F172A',
+  },
+  monochrome: {
+    ocean: '#FFFFFF', land: '#F1F5F9', coastline: '#334155', border: '#94A3B8',
+    grid: 'rgba(148, 163, 184, 0.26)', gridText: '#64748B', cityDot: '#0F172A', cityText: '#1E293B',
+    isobarDefault: '#0F172A', labelHalo: 'rgba(255, 255, 255, 0.96)', frameBg: '#FFFFFF',
+    frameBorder: '#94A3B8', headerBg: 'rgba(255, 255, 255, 0.96)', headerText: '#0F172A',
+  },
+  night: {
+    ocean: '#0C1628', land: '#1A293E', coastline: '#4B6584', border: '#334863',
+    grid: 'rgba(148, 163, 184, 0.16)', gridText: '#7C93B0', cityDot: '#94A3B8', cityText: '#CBD5E1',
+    isobarDefault: '#E2E8F0', labelHalo: 'rgba(12, 22, 40, 0.9)', frameBg: '#09111F',
+    frameBorder: '#273852', headerBg: 'rgba(15, 23, 42, 0.9)', headerText: '#F1F5F9',
+  },
+};
+
+function smoothPolyline(rawPoints, subdivisions = 6) {
+  if (rawPoints.length <= 2) return rawPoints;
+  const thinned = [rawPoints[0]];
+  for (let i = 1; i < rawPoints.length - 1; i++) {
+    const last = thinned[thinned.length - 1];
+    const dx = rawPoints[i].x - last.x;
+    const dy = rawPoints[i].y - last.y;
+    if (dx * dx + dy * dy >= 64) thinned.push(rawPoints[i]);
+  }
+  thinned.push(rawPoints[rawPoints.length - 1]);
+  if (thinned.length <= 2) return thinned;
+
+  const result = [];
+  for (let i = 0; i < thinned.length - 1; i++) {
+    const p0 = thinned[Math.max(0, i - 1)];
+    const p1 = thinned[i];
+    const p2 = thinned[i + 1];
+    const p3 = thinned[Math.min(thinned.length - 1, i + 2)];
+    for (let s = 0; s < subdivisions; s++) {
+      const t = s / subdivisions, t2 = t * t, t3 = t2 * t;
+      result.push({
+        x: 0.5 * (2 * p1.x + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+        y: 0.5 * (2 * p1.y + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3),
+      });
+    }
+  }
+  result.push(thinned[thinned.length - 1]);
+  return result;
+}
+
+function sampleAlongPolyline(points, step) {
+  if (points.length < 2) return { samples: [], totalLength: 0 };
+  const cumLen = [0];
+  let totalLength = 0;
+  for (let i = 1; i < points.length; i++) {
+    totalLength += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+    cumLen.push(totalLength);
+  }
+  if (totalLength < 8) return { samples: [], totalLength };
+
+  const samples = [];
+  let segIdx = 0;
+  const startOffset = Math.min(step * 0.5, totalLength * 0.15);
+  for (let d = startOffset; d <= totalLength - startOffset * 0.5; d += step) {
+    while (segIdx < cumLen.length - 2 && cumLen[segIdx + 1] < d) segIdx++;
+    const segLen = Math.max(0.0001, cumLen[segIdx + 1] - cumLen[segIdx]);
+    const t = Math.max(0, Math.min(1, (d - cumLen[segIdx]) / segLen));
+    const pA = points[segIdx], pB = points[segIdx + 1];
+    const dx = pB.x - pA.x, dy = pB.y - pA.y;
+    const len = Math.max(0.0001, Math.hypot(dx, dy));
+    samples.push({ x: pA.x + dx * t, y: pA.y + dy * t, tx: dx / len, ty: dy / len, dist: d });
+  }
+  return { samples, totalLength };
+}
+
+function getPointAtFraction(points, fraction) {
+  if (points.length < 2) return null;
+  const cumLen = [0];
+  let totalLength = 0;
+  for (let i = 1; i < points.length; i++) {
+    totalLength += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+    cumLen.push(totalLength);
+  }
+  if (totalLength < 2) return null;
+  const target = totalLength * fraction;
+  let segIdx = 0;
+  while (segIdx < cumLen.length - 2 && cumLen[segIdx + 1] < target) segIdx++;
+  const segLen = Math.max(0.0001, cumLen[segIdx + 1] - cumLen[segIdx]);
+  const t = (target - cumLen[segIdx]) / segLen;
+  const pA = points[segIdx], pB = points[segIdx + 1];
+  const dx = pB.x - pA.x, dy = pB.y - pA.y;
+  const len = Math.max(0.0001, Math.hypot(dx, dy));
+  return { x: pA.x + dx * t, y: pA.y + dy * t, tx: dx / len, ty: dy / len, dist: target };
+}
+
+function drawSmoothCurvePath(ctx, points) {
+  if (points.length < 2) return;
+  ctx.beginPath();
+  ctx.moveTo(points[0].x, points[0].y);
+  for (let i = 1; i < points.length - 1; i++) {
+    ctx.quadraticCurveTo(points[i].x, points[i].y, (points[i].x + points[i + 1].x) * 0.5, (points[i].y + points[i + 1].y) * 0.5);
+  }
+  ctx.lineTo(points[points.length - 1].x, points[points.length - 1].y);
+}
+
+function drawSemicircle(ctx, x, y, tx, ty, radius, sideSign, color) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(Math.atan2(ty, tx));
+  ctx.beginPath();
+  if (sideSign > 0) ctx.arc(0, 0, radius, 0, Math.PI, false);
+  else ctx.arc(0, 0, radius, Math.PI, 0, false);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawTriangle(ctx, x, y, tx, ty, baseHalf, height, sideSign, color) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(Math.atan2(ty, tx));
+  ctx.beginPath();
+  ctx.moveTo(-baseHalf, 0);
+  ctx.lineTo(baseHalf, 0);
+  ctx.lineTo(0, sideSign * height);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.restore();
+}
+
+function renderBaseMap(ctx, baseMap) {
+  const palette = MAP_THEMES[baseMap.theme];
+  const geom = cachedGeometry;
+
+  ctx.fillStyle = palette.ocean;
+  ctx.fillRect(0, 0, CHART_WIDTH, CHART_HEIGHT);
+
+  ctx.save();
+  ctx.beginPath();
+  for (const ring of geom.landRings) {
+    const pts = ring.points;
+    if (pts.length < 4) continue;
+    ctx.moveTo(pts[0], pts[1]);
+    for (let i = 2; i < pts.length; i += 2) ctx.lineTo(pts[i], pts[i + 1]);
+    ctx.closePath();
+  }
+  ctx.fillStyle = palette.land;
+  ctx.fill();
+  ctx.lineWidth = 1.1;
+  ctx.strokeStyle = palette.coastline;
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+  ctx.restore();
+
+  if (baseMap.showBorders) {
+    ctx.save();
+    ctx.beginPath();
+    for (const line of geom.borderLines) {
+      const pts = line.points;
+      if (pts.length < 4) continue;
+      ctx.moveTo(pts[0], pts[1]);
+      for (let i = 2; i < pts.length; i += 2) ctx.lineTo(pts[i], pts[i + 1]);
+    }
+    ctx.strokeStyle = palette.border;
+    ctx.lineWidth = 0.8;
+    ctx.setLineDash([4, 3]);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  if (baseMap.showGrid) {
+    ctx.save();
+    ctx.strokeStyle = palette.grid;
+    ctx.lineWidth = 0.85;
+    ctx.font = '500 10px "JetBrains Mono", monospace';
+    ctx.fillStyle = palette.gridText;
+
+    for (let lat = 15; lat <= 55; lat += 5) {
+      ctx.beginPath();
+      let started = false;
+      for (let lon = 105; lon <= 170; lon += 1.5) {
+        const pt = projectLonLat(lon, lat);
+        if (!started) { ctx.moveTo(pt.x, pt.y); started = true; }
+        else ctx.lineTo(pt.x, pt.y);
+      }
+      ctx.stroke();
+      for (let lon = 112; lon <= 128; lon += 0.5) {
+        const pt = projectLonLat(lon, lat);
+        if (pt.x >= 18 && pt.x <= 90 && pt.y >= 24 && pt.y <= CHART_HEIGHT - 20) {
+          ctx.fillText(`${lat}°N`, 10, pt.y - 3);
+          break;
+        }
+      }
+    }
+
+    for (let lon = 110; lon <= 165; lon += 5) {
+      ctx.beginPath();
+      let started = false;
+      for (let lat = 15; lat <= 55; lat += 1.5) {
+        const pt = projectLonLat(lon, lat);
+        if (!started) { ctx.moveTo(pt.x, pt.y); started = true; }
+        else ctx.lineTo(pt.x, pt.y);
+      }
+      ctx.stroke();
+      for (let lat = 18; lat <= 30; lat += 0.5) {
+        const pt = projectLonLat(lon, lat);
+        if (pt.y <= CHART_HEIGHT - 12 && pt.y >= CHART_HEIGHT - 60 && pt.x >= 40 && pt.x <= CHART_WIDTH - 40) {
+          ctx.fillText(`${lon}°E`, pt.x + 3, CHART_HEIGHT - 10);
+          break;
+        }
+      }
+    }
+    ctx.restore();
+  }
+
+  if (baseMap.showCities) {
+    ctx.save();
+    ctx.font = '500 11px "IBM Plex Sans JP", sans-serif';
+    for (const city of REFERENCE_CITIES) {
+      if (city.x < 16 || city.x > CHART_WIDTH - 16 || city.y < 16 || city.y > CHART_HEIGHT - 16) continue;
+      ctx.beginPath();
+      ctx.arc(city.x, city.y, city.isMajor ? 2.8 : 2, 0, Math.PI * 2);
+      ctx.fillStyle = palette.cityDot;
+      ctx.fill();
+      ctx.strokeStyle = palette.labelHalo;
+      ctx.lineWidth = 3;
+      ctx.lineJoin = 'round';
+      ctx.strokeText(city.name, city.x + 6, city.y + 4);
+      ctx.fillStyle = palette.cityText;
+      ctx.fillText(city.name, city.x + 6, city.y + 4);
+    }
+    ctx.restore();
+  }
+
+  ctx.save();
+  ctx.strokeStyle = palette.frameBorder;
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(0.75, 0.75, CHART_WIDTH - 1.5, CHART_HEIGHT - 1.5);
+  ctx.restore();
+}
+
+function renderChartHeader(ctx, baseMap) {
+  if (!baseMap.showChartHeader) return;
+  const palette = MAP_THEMES[baseMap.theme];
+  ctx.save();
+  const boxX = 18, boxY = 18;
+  const titleText = baseMap.chartTitle || '地上天気図';
+  const dateText = baseMap.chartDateText || '';
+  ctx.font = '700 16px "IBM Plex Sans JP", sans-serif';
+  const titleW = ctx.measureText(titleText).width;
+  ctx.font = '500 12px "JetBrains Mono", "IBM Plex Sans JP", monospace';
+  const dateW = dateText ? ctx.measureText(dateText).width : 0;
+  const boxW = Math.max(titleW, dateW) + 28;
+  const boxH = dateText ? 54 : 34;
+
+  ctx.fillStyle = palette.headerBg;
+  ctx.strokeStyle = palette.frameBorder;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(boxX, boxY, boxW, boxH, 4);
+  else ctx.rect(boxX, boxY, boxW, boxH);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = palette.headerText;
+  ctx.font = '700 15px "IBM Plex Sans JP", sans-serif';
+  ctx.textBaseline = 'top';
+  ctx.fillText(titleText, boxX + 14, boxY + 9);
+  if (dateText) {
+    ctx.font = '500 11.5px "JetBrains Mono", "IBM Plex Sans JP", monospace';
+    ctx.globalAlpha = 0.78;
+    ctx.fillText(dateText, boxX + 14, boxY + 31);
+  }
+  ctx.restore();
+}
+
+function renderStrokeItem(ctx, item, baseMap, isSelected = false) {
+  const pts = item.points;
+  if (pts.length < 2) return;
+  const palette = MAP_THEMES[baseMap.theme];
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  if (isSelected) {
+    ctx.save();
+    drawSmoothCurvePath(ctx, pts);
+    ctx.strokeStyle = 'rgba(14, 165, 233, 0.35)';
+    ctx.lineWidth = item.strokeWidth + 8;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  const spacing = item.symbolSpacing ?? 32;
+  const symSize = item.symbolSize ?? 8;
+  const sideSign = item.flipSide ? 1 : -1;
+
+  if (item.kind === 'isobar') {
+    drawSmoothCurvePath(ctx, pts);
+    const strokeColor = item.color === '#AUTO' ? palette.isobarDefault : item.color;
+    ctx.strokeStyle = strokeColor;
+    ctx.lineWidth = item.strokeWidth;
+    if (item.lineStyle === 'dashed') ctx.setLineDash([8, 6]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    if (item.pressureLabel && item.pressureLabel.trim()) {
+      const mid = getPointAtFraction(pts, 0.5);
+      if (mid) {
+        const label = item.pressureLabel.trim();
+        ctx.save();
+        ctx.font = '600 12px "JetBrains Mono", monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        const m = ctx.measureText(label);
+        ctx.fillStyle = palette.labelHalo;
+        ctx.fillRect(mid.x - m.width / 2 - 5, mid.y - 9, m.width + 10, 18);
+        ctx.fillStyle = strokeColor;
+        ctx.fillText(label, mid.x, mid.y);
+        ctx.restore();
+      }
+    }
+  } else if (item.kind === 'warm_front') {
+    const color = '#DC2626';
+    drawSmoothCurvePath(ctx, pts);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = item.strokeWidth;
+    ctx.stroke();
+    for (const s of sampleAlongPolyline(pts, spacing).samples) {
+      drawSemicircle(ctx, s.x, s.y, s.tx, s.ty, symSize * 0.9, sideSign, color);
+    }
+  } else if (item.kind === 'cold_front') {
+    const color = '#2563EB';
+    drawSmoothCurvePath(ctx, pts);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = item.strokeWidth;
+    ctx.stroke();
+    for (const s of sampleAlongPolyline(pts, spacing).samples) {
+      drawTriangle(ctx, s.x, s.y, s.tx, s.ty, symSize * 0.78, symSize * 1.35, sideSign, color);
+    }
+  } else if (item.kind === 'stationary_front') {
+    const warmColor = '#DC2626', coldColor = '#2563EB';
+    const { samples } = sampleAlongPolyline(pts, spacing);
+    drawSmoothCurvePath(ctx, pts);
+    ctx.strokeStyle = warmColor;
+    ctx.lineWidth = item.strokeWidth;
+    ctx.stroke();
+    if (samples.length > 0) {
+      drawSmoothCurvePath(ctx, pts);
+      ctx.strokeStyle = coldColor;
+      ctx.lineWidth = item.strokeWidth;
+      ctx.setLineDash([spacing, spacing]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      samples.forEach((s, idx) => {
+        if (idx % 2 === 0) drawSemicircle(ctx, s.x, s.y, s.tx, s.ty, symSize * 0.88, sideSign, warmColor);
+        else drawTriangle(ctx, s.x, s.y, s.tx, s.ty, symSize * 0.76, symSize * 1.32, -sideSign, coldColor);
+      });
+    }
+  } else if (item.kind === 'occluded_front') {
+    const color = '#7C3AED';
+    drawSmoothCurvePath(ctx, pts);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = item.strokeWidth;
+    ctx.stroke();
+    sampleAlongPolyline(pts, spacing).samples.forEach((s, idx) => {
+      if (idx % 2 === 0) drawSemicircle(ctx, s.x, s.y, s.tx, s.ty, symSize * 0.88, sideSign, color);
+      else drawTriangle(ctx, s.x, s.y, s.tx, s.ty, symSize * 0.76, symSize * 1.32, sideSign, color);
+    });
+  } else if (item.kind === 'trough') {
+    drawSmoothCurvePath(ctx, pts);
+    ctx.strokeStyle = item.color || '#B45309';
+    ctx.lineWidth = Math.max(2.5, item.strokeWidth);
+    ctx.setLineDash([12, 8]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  } else if (item.kind === 'arrow') {
+    const color = item.color || '#0F766E';
+    drawSmoothCurvePath(ctx, pts);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = item.strokeWidth;
+    if (item.lineStyle === 'dashed') ctx.setLineDash([7, 5]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    const n = pts.length, end = pts[n - 1], prev = pts[Math.max(0, n - 4)];
+    const angle = Math.atan2(end.y - prev.y, end.x - prev.x);
+    const headLen = 10 + item.strokeWidth * 1.8;
+    ctx.save();
+    ctx.translate(end.x, end.y);
+    ctx.rotate(angle);
+    ctx.beginPath();
+    ctx.moveTo(2, 0);
+    ctx.lineTo(-headLen, -headLen * 0.48);
+    ctx.lineTo(-headLen * 0.72, 0);
+    ctx.lineTo(-headLen, headLen * 0.48);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.restore();
+  } else if (item.kind === 'pen') {
+    drawSmoothCurvePath(ctx, pts);
+    ctx.strokeStyle = item.color || '#0F172A';
+    ctx.lineWidth = item.strokeWidth;
+    if (item.lineStyle === 'dashed') ctx.setLineDash([8, 6]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.restore();
+}
+
+function renderStampItem(ctx, item, baseMap, isSelected = false) {
+  const palette = MAP_THEMES[baseMap.theme];
+  ctx.save();
+  ctx.translate(item.x, item.y);
+  ctx.scale(item.scale, item.scale);
+
+  if (isSelected) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(0, 0, 30, 0, Math.PI * 2);
+    ctx.strokeStyle = '#0EA5E9';
+    ctx.lineWidth = 1.5 / item.scale;
+    ctx.setLineDash([4, 3]);
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(14, 165, 233, 0.1)';
+    ctx.fill();
+    ctx.restore();
+  }
+
+  if (item.kind === 'high' || item.kind === 'low' || item.kind === 'td') {
+    const labelMap = {
+      high: item.labelStyle === 'ja' ? '高' : 'H',
+      low: item.labelStyle === 'ja' ? '低' : 'L',
+      td: item.labelStyle === 'ja' ? '熱' : 'TD',
+    };
+    const defaultColors = { high: '#2563EB', low: '#DC2626', td: '#0284C7' };
+    const color = item.color || defaultColors[item.kind];
+    const mainLabel = labelMap[item.kind];
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.3;
+    ctx.globalAlpha = 0.55;
+    ctx.beginPath();
+    ctx.moveTo(-4, 16); ctx.lineTo(4, 16);
+    ctx.moveTo(0, 12); ctx.lineTo(0, 20);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    ctx.font = item.labelStyle === 'ja'
+      ? '700 28px "IBM Plex Sans JP", sans-serif'
+      : '700 30px "Plus Jakarta Sans", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 5;
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = palette.labelHalo;
+    ctx.strokeText(mainLabel, 0, -2);
+    ctx.fillStyle = color;
+    ctx.fillText(mainLabel, 0, -2);
+
+    if (item.pressure && item.pressure.trim()) {
+      ctx.font = '600 12.5px "JetBrains Mono", monospace';
+      ctx.lineWidth = 3.5;
+      ctx.strokeStyle = palette.labelHalo;
+      ctx.strokeText(item.pressure.trim(), 0, 29);
+      ctx.fillStyle = color;
+      ctx.fillText(item.pressure.trim(), 0, 29);
+    }
+    if (item.movementText && item.movementText.trim()) {
+      const yOffset = item.pressure && item.pressure.trim() ? 43 : 29;
+      ctx.font = '500 10.5px "IBM Plex Sans JP", sans-serif';
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = palette.labelHalo;
+      ctx.strokeText(item.movementText.trim(), 0, yOffset);
+      ctx.fillStyle = palette.cityText;
+      ctx.fillText(item.movementText.trim(), 0, yOffset);
+    }
+  } else if (item.kind === 'typhoon') {
+    const color = item.color || '#059669';
+    ctx.save();
+    ctx.strokeStyle = palette.labelHalo;
+    ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.arc(0, -2, 8.5, 0, Math.PI * 2); ctx.stroke();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.6;
+    ctx.beginPath(); ctx.arc(0, -2, 8, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(4, -9); ctx.quadraticCurveTo(13, -15, 16, -21);
+    ctx.moveTo(-4, 5); ctx.quadraticCurveTo(-13, 11, -16, 17);
+    ctx.stroke();
+    ctx.restore();
+
+    const subLabel = item.labelStyle === 'ja' ? '台' : 'T';
+    ctx.font = '700 13px "IBM Plex Sans JP", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 3.5;
+    ctx.strokeStyle = palette.labelHalo;
+    ctx.strokeText(subLabel, 21, -2);
+    ctx.fillStyle = color;
+    ctx.fillText(subLabel, 21, -2);
+
+    if (item.pressure && item.pressure.trim()) {
+      ctx.font = '600 12.5px "JetBrains Mono", monospace';
+      ctx.lineWidth = 3.5;
+      ctx.strokeStyle = palette.labelHalo;
+      ctx.strokeText(item.pressure.trim(), 0, 22);
+      ctx.fillStyle = color;
+      ctx.fillText(item.pressure.trim(), 0, 22);
+    }
+    if (item.movementText && item.movementText.trim()) {
+      const yOffset = item.pressure && item.pressure.trim() ? 36 : 22;
+      ctx.font = '500 10.5px "IBM Plex Sans JP", sans-serif';
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = palette.labelHalo;
+      ctx.strokeText(item.movementText.trim(), 0, yOffset);
+      ctx.fillStyle = palette.cityText;
+      ctx.fillText(item.movementText.trim(), 0, yOffset);
+    }
+  } else if (item.kind === 'weather_sunny') {
+    ctx.save();
+    ctx.beginPath(); ctx.arc(0, 0, 20, 0, Math.PI * 2); ctx.fillStyle = palette.labelHalo; ctx.fill();
+    ctx.strokeStyle = '#EA580C'; ctx.lineWidth = 2.6; ctx.lineCap = 'round';
+    for (let i = 0; i < 8; i++) {
+      const a = (i * Math.PI) / 4;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a) * 11, Math.sin(a) * 11);
+      ctx.lineTo(Math.cos(a) * 15.5, Math.sin(a) * 15.5);
+      ctx.stroke();
+    }
+    ctx.beginPath(); ctx.arc(0, 0, 7.8, 0, Math.PI * 2);
+    ctx.fillStyle = '#FB923C'; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = '#EA580C'; ctx.stroke();
+    ctx.restore();
+  } else if (item.kind === 'weather_cloudy') {
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(-10, 9); ctx.lineTo(11, 9);
+    ctx.arc(11, 2.5, 6.5, Math.PI / 2, -Math.PI / 2, true);
+    ctx.arc(2, -3.5, 8.5, 0, Math.PI * 1.15, true);
+    ctx.arc(-9.5, 2, 7, -Math.PI * 0.55, Math.PI / 2, true);
+    ctx.closePath();
+    ctx.lineJoin = 'round'; ctx.lineWidth = 6; ctx.strokeStyle = palette.labelHalo; ctx.stroke();
+    ctx.fillStyle = '#CBD5E1'; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = '#475569'; ctx.stroke();
+    ctx.restore();
+  } else if (item.kind === 'weather_partly') {
+    ctx.save();
+    ctx.beginPath(); ctx.arc(-7, -6, 11, 0, Math.PI * 2); ctx.fillStyle = palette.labelHalo; ctx.fill();
+    ctx.strokeStyle = '#EA580C'; ctx.lineWidth = 2; ctx.lineCap = 'round';
+    for (let i = 0; i < 8; i++) {
+      const a = (i * Math.PI) / 4;
+      ctx.beginPath();
+      ctx.moveTo(-7 + Math.cos(a) * 7.5, -6 + Math.sin(a) * 7.5);
+      ctx.lineTo(-7 + Math.cos(a) * 10.5, -6 + Math.sin(a) * 10.5);
+      ctx.stroke();
+    }
+    ctx.beginPath(); ctx.arc(-7, -6, 5.5, 0, Math.PI * 2);
+    ctx.fillStyle = '#FB923C'; ctx.fill(); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-7, 11); ctx.lineTo(12, 11);
+    ctx.arc(12, 5.5, 5.5, Math.PI / 2, -Math.PI / 2, true);
+    ctx.arc(4, 0, 7, 0, Math.PI * 1.15, true);
+    ctx.arc(-6.5, 5, 5.8, -Math.PI * 0.55, Math.PI / 2, true);
+    ctx.closePath();
+    ctx.lineJoin = 'round'; ctx.lineWidth = 5; ctx.strokeStyle = palette.labelHalo; ctx.stroke();
+    ctx.fillStyle = '#F1F5F9'; ctx.fill();
+    ctx.lineWidth = 1.9; ctx.strokeStyle = '#475569'; ctx.stroke();
+    ctx.restore();
+  } else if (item.kind === 'weather_rain') {
+    ctx.save();
+    ctx.beginPath(); ctx.arc(0, 0, 20, 0, Math.PI * 2); ctx.fillStyle = palette.labelHalo; ctx.fill();
+    ctx.strokeStyle = '#1E3A8A'; ctx.lineWidth = 2.2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.beginPath(); ctx.moveTo(0, -15.5); ctx.lineTo(0, 10.5);
+    ctx.arc(-3.5, 10.5, 3.5, 0, Math.PI, false); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, 14, Math.PI, 0, false);
+    ctx.quadraticCurveTo(9, -3.5, 5, 0); ctx.quadraticCurveTo(0, -3.5, -5, 0); ctx.quadraticCurveTo(-9, -3.5, -14, 0);
+    ctx.closePath(); ctx.fillStyle = '#0284C7'; ctx.fill();
+    ctx.lineWidth = 1.8; ctx.strokeStyle = '#0369A1'; ctx.stroke();
+    ctx.fillStyle = '#38BDF8';
+    for (const [rx, ry] of [[-11, 7], [10, 8]]) {
+      ctx.beginPath(); ctx.moveTo(rx, ry - 3.5);
+      ctx.quadraticCurveTo(rx + 2.8, ry + 1, rx, ry + 3);
+      ctx.quadraticCurveTo(rx - 2.8, ry + 1, rx, ry - 3.5);
+      ctx.fill();
+    }
+    ctx.restore();
+  } else if (item.kind === 'weather_snow') {
+    ctx.save();
+    ctx.beginPath(); ctx.arc(0, 0, 19, 0, Math.PI * 2); ctx.fillStyle = palette.labelHalo; ctx.fill();
+    ctx.strokeStyle = '#0284C7'; ctx.lineWidth = 2.2; ctx.lineCap = 'round';
+    for (let i = 0; i < 6; i++) {
+      const a = (i * Math.PI) / 3, cos = Math.cos(a), sin = Math.sin(a);
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(cos * 14, sin * 14); ctx.stroke();
+      const bx = cos * 9, by = sin * 9, a1 = a + Math.PI / 5, a2 = a - Math.PI / 5;
+      ctx.beginPath();
+      ctx.moveTo(bx, by); ctx.lineTo(bx + Math.cos(a1) * 4.2, by + Math.sin(a1) * 4.2);
+      ctx.moveTo(bx, by); ctx.lineTo(bx + Math.cos(a2) * 4.2, by + Math.sin(a2) * 4.2);
+      ctx.stroke();
+    }
+    ctx.beginPath(); ctx.arc(0, 0, 3.2, 0, Math.PI * 2);
+    ctx.fillStyle = '#E0F2FE'; ctx.fill(); ctx.stroke();
+    ctx.restore();
+  } else if (item.kind === 'weather_thunder') {
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(-9.5, 4); ctx.lineTo(10.5, 4);
+    ctx.arc(10.5, -1.5, 5.5, Math.PI / 2, -Math.PI / 2, true);
+    ctx.arc(2, -7, 7.5, 0, Math.PI * 1.15, true);
+    ctx.arc(-9, -2, 6, -Math.PI * 0.55, Math.PI / 2, true);
+    ctx.closePath();
+    ctx.lineJoin = 'round'; ctx.lineWidth = 5; ctx.strokeStyle = palette.labelHalo; ctx.stroke();
+    ctx.fillStyle = '#64748B'; ctx.fill();
+    ctx.lineWidth = 1.8; ctx.strokeStyle = '#334155'; ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(1.5, 0.5); ctx.lineTo(-4, 9); ctx.lineTo(0.5, 9);
+    ctx.lineTo(-2, 17); ctx.lineTo(6.5, 7); ctx.lineTo(1.8, 7);
+    ctx.closePath();
+    ctx.lineWidth = 3; ctx.strokeStyle = palette.labelHalo; ctx.stroke();
+    ctx.fillStyle = '#FACC15'; ctx.fill();
+    ctx.lineWidth = 1.1; ctx.strokeStyle = '#CA8A04'; ctx.stroke();
+    ctx.restore();
+  } else if (item.kind === 'text') {
+    const content = item.text || 'メモ';
+    const color = item.color || palette.isobarDefault;
+    ctx.font = '600 15px "IBM Plex Sans JP", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 4;
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = palette.labelHalo;
+    ctx.strokeText(content, 0, 0);
+    ctx.fillStyle = color;
+    ctx.fillText(content, 0, 0);
+  }
+
+  if (item.kind.startsWith('weather_') && item.text && item.text.trim()) {
+    ctx.font = '600 11.5px "IBM Plex Sans JP", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 3.5;
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = palette.labelHalo;
+    ctx.strokeText(item.text.trim(), 0, 27);
+    ctx.fillStyle = palette.cityText;
+    ctx.fillText(item.text.trim(), 0, 27);
+  }
+  ctx.restore();
+}
+
+function renderWeatherChart(ctx, state, options) {
+  const scale = (options && options.scale) ?? 1;
+  ctx.save();
+  ctx.scale(scale, scale);
+  renderBaseMap(ctx, state.baseMap);
+  for (const layer of state.layers) {
+    if (!layer.visible) continue;
+    ctx.save();
+    ctx.globalAlpha = layer.opacity;
+    for (const item of layer.items) {
+      const isSelected = options && options.selectedItemId === item.id;
+      if (item.itemType === 'stroke') renderStrokeItem(ctx, item, state.baseMap, isSelected);
+      else renderStampItem(ctx, item, state.baseMap, isSelected);
+    }
+    ctx.restore();
+  }
+  if (options && options.previewStroke) renderStrokeItem(ctx, options.previewStroke, state.baseMap, false);
+  renderChartHeader(ctx, state.baseMap);
+  ctx.restore();
+}
+
+function generateSnapshotThumbnail(state) {
+  const thumbW = 320, thumbH = 240;
+  const canvas = document.createElement('canvas');
+  canvas.width = thumbW;
+  canvas.height = thumbH;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return '';
+  renderWeatherChart(ctx, state, { scale: thumbW / CHART_WIDTH });
+  return canvas.toDataURL('image/jpeg', 0.75);
+}
+
+function distToSegment(p, a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const l2 = dx * dx + dy * dy;
+  if (l2 === 0) return Math.hypot(p.x - a.x, p.y - a.y);
+  const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2));
+  return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+}
+
+function hitTestItem(item, pt, tolerance = 14) {
+  if (item.itemType === 'stamp') {
+    const r = Math.max(24, 28 * item.scale) + tolerance * 0.4;
+    return Math.hypot(pt.x - item.x, pt.y - item.y) <= r;
+  }
+  const pts = item.points;
+  for (let i = 0; i < pts.length - 1; i++) {
+    if (distToSegment(pt, pts[i], pts[i + 1]) <= tolerance) return true;
+  }
+  return false;
+}
+
+// === 3. Preset Charts ===
+function ptsFromLonLat(coords) {
+  return smoothPolyline(coords.map(([lon, lat]) => projectLonLat(lon, lat)), 8);
+}
+function makePresetId(prefix) {
+  return `${prefix}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function createBlankDocument() {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  const d = String(now.getDate()).padStart(2, '0');
+  return {
+    baseMap: {
+      theme: 'broadcast', showGrid: true, showBorders: true, showCities: true,
+      showChartHeader: true, chartTitle: '地上天気図', chartDateText: `${y}年${m}月${d}日 09時`,
+    },
+    activeLayerId: 'layer_isobar',
+    layers: [
+      { id: 'layer_isobar', name: '等圧線', visible: true, locked: false, opacity: 1, items: [] },
+      { id: 'layer_front', name: '前線', visible: true, locked: false, opacity: 1, items: [] },
+      { id: 'layer_pressure', name: '気圧中心・記号', visible: true, locked: false, opacity: 1, items: [] },
+      { id: 'layer_memo', name: 'メモ・進行方向', visible: true, locked: false, opacity: 1, items: [] },
+    ],
+  };
+}
+
+const CHART_PRESETS = [
+  {
+    id: 'preset_blank',
+    name: '白紙の天気図',
+    subtitle: '日本周辺の地図のみ。一から自由に描画します。',
+    create: createBlankDocument,
+  },
+  {
+    id: 'preset_cyclone_fronts',
+    name: '発達した低気圧と前線',
+    subtitle: '日本海の低気圧から伸びる温暖前線・寒冷前線・閉塞前線の基本配置',
+    create: () => {
+      const doc = createBlankDocument();
+      doc.baseMap.chartTitle = '予想天気図（前線・低気圧）';
+      const lowPos = projectLonLat(136.0, 39.2);
+      const highWestPos = projectLonLat(121.0, 33.0);
+      const highEastPos = projectLonLat(152.0, 34.5);
+      doc.layers[0].items = [
+        { id: makePresetId('iso'), itemType: 'stroke', kind: 'isobar', color: '#AUTO', strokeWidth: 1.8, lineStyle: 'solid', pressureLabel: '996', points: ptsFromLonLat([[134.5,41.0],[137.8,41.2],[138.8,39.0],[136.5,37.2],[133.5,38.2],[133.2,40.0],[134.5,41.0]]) },
+        { id: makePresetId('iso'), itemType: 'stroke', kind: 'isobar', color: '#AUTO', strokeWidth: 1.8, lineStyle: 'solid', pressureLabel: '1004', points: ptsFromLonLat([[132.0,43.2],[139.0,43.6],[142.2,39.5],[139.5,35.0],[134.0,34.5],[130.5,38.0],[130.4,41.5],[132.0,43.2]]) },
+        { id: makePresetId('iso'), itemType: 'stroke', kind: 'isobar', color: '#AUTO', strokeWidth: 2.2, lineStyle: 'solid', pressureLabel: '1012', points: ptsFromLonLat([[126.0,46.5],[138.0,47.0],[146.5,42.5],[144.8,33.5],[136.0,30.2],[128.5,32.5],[126.0,39.0],[126.0,46.5]]) },
+        { id: makePresetId('iso'), itemType: 'stroke', kind: 'isobar', color: '#AUTO', strokeWidth: 1.8, lineStyle: 'solid', pressureLabel: '1020', points: ptsFromLonLat([[116.0,40.0],[122.5,41.2],[125.8,35.0],[124.2,27.5],[118.0,26.5],[114.5,32.5],[116.0,40.0]]) },
+        { id: makePresetId('iso'), itemType: 'stroke', kind: 'isobar', color: '#AUTO', strokeWidth: 1.8, lineStyle: 'solid', pressureLabel: '1020', points: ptsFromLonLat([[148.0,40.5],[155.5,41.0],[158.0,34.5],[154.5,28.0],[147.8,29.0],[146.2,35.5],[148.0,40.5]]) },
+      ];
+      doc.layers[1].items = [
+        { id: makePresetId('fr'), itemType: 'stroke', kind: 'occluded_front', color: '#7C3AED', strokeWidth: 2.6, lineStyle: 'solid', flipSide: false, symbolSpacing: 30, symbolSize: 8, points: ptsFromLonLat([[136.0,39.2],[138.2,38.0],[139.6,36.8]]) },
+        { id: makePresetId('fr'), itemType: 'stroke', kind: 'warm_front', color: '#DC2626', strokeWidth: 2.6, lineStyle: 'solid', flipSide: false, symbolSpacing: 32, symbolSize: 8, points: ptsFromLonLat([[139.6,36.8],[142.5,35.8],[145.6,34.0],[148.5,31.8]]) },
+        { id: makePresetId('fr'), itemType: 'stroke', kind: 'cold_front', color: '#2563EB', strokeWidth: 2.6, lineStyle: 'solid', flipSide: true, symbolSpacing: 32, symbolSize: 8, points: ptsFromLonLat([[139.6,36.8],[136.8,33.8],[133.2,30.8],[129.0,28.0],[125.0,26.2]]) },
+      ];
+      doc.layers[2].items = [
+        { id: makePresetId('st'), itemType: 'stamp', kind: 'low', x: lowPos.x, y: lowPos.y, labelStyle: 'ja', pressure: '994', movementText: '北東 35km/h', color: '#DC2626', scale: 1 },
+        { id: makePresetId('st'), itemType: 'stamp', kind: 'high', x: highWestPos.x, y: highWestPos.y, labelStyle: 'ja', pressure: '1024', movementText: '東 20km/h', color: '#2563EB', scale: 1 },
+        { id: makePresetId('st'), itemType: 'stamp', kind: 'high', x: highEastPos.x, y: highEastPos.y, labelStyle: 'ja', pressure: '1022', movementText: 'ほとんど停滞', color: '#2563EB', scale: 1 },
+      ];
+      return doc;
+    },
+  },
+  {
+    id: 'preset_winter_monsoon',
+    name: '西高東低（冬型の気圧配置）',
+    subtitle: '大陸のシベリア高気圧とオホーツク海・アリューシャン低気圧',
+    create: () => {
+      const doc = createBlankDocument();
+      doc.baseMap.chartTitle = '地上天気図（西高東低・冬型）';
+      const highSiberia = projectLonLat(116.5, 42.0);
+      const lowEast = projectLonLat(151.0, 46.5);
+      doc.layers[0].items = [
+        { id: makePresetId('iso'), itemType: 'stroke', kind: 'isobar', color: '#AUTO', strokeWidth: 1.8, lineStyle: 'solid', pressureLabel: '1036', points: ptsFromLonLat([[112.0,46.5],[120.5,46.0],[122.0,38.5],[115.0,36.0],[110.5,40.5],[112.0,46.5]]) },
+        { id: makePresetId('iso'), itemType: 'stroke', kind: 'isobar', color: '#AUTO', strokeWidth: 1.8, lineStyle: 'solid', pressureLabel: '1028', points: ptsFromLonLat([[126.0,48.0],[128.0,39.0],[125.0,30.0],[118.0,23.0]]) },
+        { id: makePresetId('iso'), itemType: 'stroke', kind: 'isobar', color: '#AUTO', strokeWidth: 2.2, lineStyle: 'solid', pressureLabel: '1020', points: ptsFromLonLat([[132.0,49.0],[133.5,40.0],[130.5,31.0],[125.0,22.0]]) },
+        { id: makePresetId('iso'), itemType: 'stroke', kind: 'isobar', color: '#AUTO', strokeWidth: 1.8, lineStyle: 'solid', pressureLabel: '1012', points: ptsFromLonLat([[137.0,49.5],[138.5,41.0],[136.5,32.0],[132.5,22.5]]) },
+        { id: makePresetId('iso'), itemType: 'stroke', kind: 'isobar', color: '#AUTO', strokeWidth: 1.8, lineStyle: 'solid', pressureLabel: '1004', points: ptsFromLonLat([[142.0,50.0],[144.0,42.0],[142.5,33.5],[139.0,24.0]]) },
+        { id: makePresetId('iso'), itemType: 'stroke', kind: 'isobar', color: '#AUTO', strokeWidth: 1.8, lineStyle: 'solid', pressureLabel: '988', points: ptsFromLonLat([[147.0,49.5],[154.5,49.0],[156.0,44.0],[149.0,42.5],[145.5,46.0],[147.0,49.5]]) },
+      ];
+      doc.layers[2].items = [
+        { id: makePresetId('st'), itemType: 'stamp', kind: 'high', x: highSiberia.x, y: highSiberia.y, labelStyle: 'ja', pressure: '1040', movementText: 'ほとんど停滞', color: '#2563EB', scale: 1 },
+        { id: makePresetId('st'), itemType: 'stamp', kind: 'low', x: lowEast.x, y: lowEast.y, labelStyle: 'ja', pressure: '984', movementText: '北東 25km/h', color: '#DC2626', scale: 1 },
+      ];
+      return doc;
+    },
+  },
+  {
+    id: 'preset_baiu_typhoon',
+    name: '梅雨前線と台風接近',
+    subtitle: '本州南岸の停滞前線と沖縄南海上の台風',
+    create: () => {
+      const doc = createBlankDocument();
+      doc.baseMap.chartTitle = '予想天気図（停滞前線・台風）';
+      const pacificHigh = projectLonLat(150.0, 27.0);
+      const typhoonPos = projectLonLat(128.5, 24.5);
+      const waveLow = projectLonLat(135.5, 32.8);
+      doc.layers[0].items = [
+        { id: makePresetId('iso'), itemType: 'stroke', kind: 'isobar', color: '#AUTO', strokeWidth: 1.8, lineStyle: 'solid', pressureLabel: '1020', points: ptsFromLonLat([[144.0,31.0],[152.5,31.5],[156.0,26.5],[152.0,21.5],[144.0,23.0],[142.5,28.0],[144.0,31.0]]) },
+        { id: makePresetId('iso'), itemType: 'stroke', kind: 'isobar', color: '#AUTO', strokeWidth: 1.8, lineStyle: 'solid', pressureLabel: '1000', points: ptsFromLonLat([[126.5,27.5],[131.0,27.2],[132.0,23.0],[128.0,21.2],[125.0,24.0],[126.5,27.5]]) },
+        { id: makePresetId('iso'), itemType: 'stroke', kind: 'isobar', color: '#AUTO', strokeWidth: 1.8, lineStyle: 'solid', pressureLabel: '1008', points: ptsFromLonLat([[122.0,31.0],[133.5,30.8],[136.0,23.5],[128.0,18.5],[121.0,23.5],[122.0,31.0]]) },
+      ];
+      doc.layers[1].items = [
+        { id: makePresetId('fr'), itemType: 'stroke', kind: 'stationary_front', color: '#DC2626', strokeWidth: 2.6, lineStyle: 'solid', flipSide: true, symbolSpacing: 32, symbolSize: 8, points: ptsFromLonLat([[122.0,29.8],[128.0,31.4],[135.5,32.8],[142.0,33.8],[149.0,35.0]]) },
+      ];
+      doc.layers[2].items = [
+        { id: makePresetId('st'), itemType: 'stamp', kind: 'typhoon', x: typhoonPos.x, y: typhoonPos.y, labelStyle: 'ja', pressure: '960', movementText: '北北東 20km/h', color: '#059669', scale: 1.05 },
+        { id: makePresetId('st'), itemType: 'stamp', kind: 'low', x: waveLow.x, y: waveLow.y, labelStyle: 'ja', pressure: '1006', movementText: '東 25km/h', color: '#DC2626', scale: 0.9 },
+        { id: makePresetId('st'), itemType: 'stamp', kind: 'high', x: pacificHigh.x, y: pacificHigh.y, labelStyle: 'ja', pressure: '1024', movementText: 'ほとんど停滞', color: '#2563EB', scale: 1 },
+      ];
+      doc.layers[3].items = [
+        { id: makePresetId('arr'), itemType: 'stroke', kind: 'arrow', color: '#059669', strokeWidth: 2.4, lineStyle: 'dashed', points: ptsFromLonLat([[128.5,24.5],[130.5,28.0],[133.5,32.0]]) },
+      ];
+      return doc;
+    },
+  },
+];
+
+// === 4. Icons ===
+const UI_ICON_PATHS = {
+  download: <><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></>,
+  undo: <><path d="M9 14 4 9l5-5" /><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11" /></>,
+  redo: <><path d="m15 14 5-5-5-5" /><path d="M20 9H9.5A5.5 5.5 0 0 0 4 14.5A5.5 5.5 0 0 0 9.5 20H13" /></>,
+  bookmarkPlus: <><path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z" /><line x1="12" x2="12" y1="7" y2="13" /><line x1="15" x2="9" y1="10" y2="10" /></>,
+  filePlus: <><path d="M4 22h14a2 2 0 0 0 2-2V7l-5-5H6a2 2 0 0 0-2 2v4" /><path d="M14 2v4a2 2 0 0 0 2 2h4" /><path d="M3 15h6" /><path d="M6 12v6" /></>,
+  chevronDown: <path d="m6 9 6 6 6-6" />,
+  pointer: <path d="M4.037 4.688a.495.495 0 0 1 .651-.651l16 6.5a.5.5 0 0 1-.063.947l-6.124 1.58a2 2 0 0 0-1.438 1.435l-1.579 6.126a.5.5 0 0 1-.947.063z" />,
+  eraser: <><path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21" /><path d="M22 21H7" /><path d="m5 11 9 9" /></>,
+  arrowUpRight: <><path d="M7 7h10v10" /><path d="M7 17 17 7" /></>,
+  penTool: <><path d="M15.707 21.293a1 1 0 0 1-1.414 0l-1.586-1.586a1 1 0 0 1 0-1.414l5.586-5.586a1 1 0 0 1 1.414 0l1.586 1.586a1 1 0 0 1 0 1.414z" /><path d="m18 13-1.375-6.874a1 1 0 0 0-.746-.776L3.235 2.028a1 1 0 0 0-1.207 1.207L5.35 15.879a1 1 0 0 0 .776.746L13 18" /><path d="m2.3 2.3 7.286 7.286" /><circle cx="11" cy="11" r="2" /></>,
+  type: <><polyline points="4 7 4 4 20 4 20 7" /><line x1="9" x2="15" y1="20" y2="20" /><line x1="12" x2="12" y1="4" y2="20" /></>,
+  arrowLeftRight: <><path d="M8 3 4 7l4 4" /><path d="M4 7h16" /><path d="m16 21 4-4-4-4" /><path d="M20 17H4" /></>,
+  trash: <><path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" /><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" /><line x1="10" x2="10" y1="11" y2="17" /><line x1="14" x2="14" y1="11" y2="17" /></>,
+  minus: <path d="M5 12h14" />,
+  plus: <><path d="M5 12h14" /><path d="M12 5v14" /></>,
+  zoomIn: <><circle cx="11" cy="11" r="8" /><line x1="21" x2="16.65" y1="21" y2="16.65" /><line x1="11" x2="11" y1="8" y2="14" /><line x1="8" x2="14" y1="11" y2="11" /></>,
+  zoomOut: <><circle cx="11" cy="11" r="8" /><line x1="21" x2="16.65" y1="21" y2="16.65" /><line x1="8" x2="14" y1="11" y2="11" /></>,
+  maximize: <><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" x2="14" y1="3" y2="10" /><line x1="3" x2="10" y1="21" y2="14" /></>,
+  hand: <><path d="M18 11V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2" /><path d="M14 10V4a2 2 0 0 0-2-2a2 2 0 0 0-2 2v2" /><path d="M10 10.5V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2v8" /><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15" /></>,
+  lock: <><rect width="18" height="11" x="3" y="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></>,
+  unlock: <><rect width="18" height="11" x="3" y="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 9.9-1" /></>,
+  eye: <><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0" /><circle cx="12" cy="12" r="3" /></>,
+  eyeOff: <><path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49" /><path d="M14.084 14.158a3 3 0 0 1-4.242-4.242" /><path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143" /><path d="m2 2 20 20" /></>,
+  arrowUp: <><path d="m5 12 7-7 7 7" /><path d="M12 19V5" /></>,
+  arrowDown: <><path d="M12 5v14" /><path d="m19 12-7 7-7-7" /></>,
+  rotateCcw: <><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" /></>,
+  layers: <><path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z" /><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65" /><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65" /></>,
+  history: <><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" /><path d="M12 7v5l4 2" /></>,
+  x: <><path d="M18 6 6 18" /><path d="m6 6 12 12" /></>,
+  copy: <><rect width="14" height="14" x="8" y="8" rx="2" ry="2" /><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" /></>,
+  check: <path d="M20 6 9 17l-5-5" />,
+};
+
+const UiIcon = ({ name, className = 'w-4 h-4' }) => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+    {UI_ICON_PATHS[name]}
+  </svg>
+);
+
+const IsobarIcon = ({ className = 'w-4 h-4' }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className} stroke="currentColor" strokeWidth="1.8">
+    <path d="M4 16c3-7 13-9 16-2" strokeLinecap="round" />
+    <path d="M5 10c3-4 10-5 14-1" strokeLinecap="round" strokeDasharray="3 2.5" />
+    <text x="11" y="20" fontSize="6" fill="currentColor" stroke="none" fontFamily="monospace" fontWeight="700">hPa</text>
+  </svg>
+);
+const WarmFrontIcon = ({ className = 'w-4 h-4' }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <line x1="2" y1="15" x2="22" y2="15" stroke="#DC2626" strokeWidth="2.2" strokeLinecap="round" />
+    <path d="M5 15a3.5 3.5 0 0 1 7 0Z" fill="#DC2626" /><path d="M13 15a3.5 3.5 0 0 1 7 0Z" fill="#DC2626" />
+  </svg>
+);
+const ColdFrontIcon = ({ className = 'w-4 h-4' }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <line x1="2" y1="15" x2="22" y2="15" stroke="#2563EB" strokeWidth="2.2" strokeLinecap="round" />
+    <polygon points="5,15 8.5,8.5 12,15" fill="#2563EB" /><polygon points="13,15 16.5,8.5 20,15" fill="#2563EB" />
+  </svg>
+);
+const StationaryFrontIcon = ({ className = 'w-4 h-4' }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <line x1="2" y1="12" x2="12" y2="12" stroke="#DC2626" strokeWidth="2.2" strokeLinecap="round" />
+    <line x1="12" y1="12" x2="22" y2="12" stroke="#2563EB" strokeWidth="2.2" strokeLinecap="round" />
+    <path d="M4 12a3.5 3.5 0 0 1 7 0Z" fill="#DC2626" /><polygon points="13,12 16.5,18.5 20,12" fill="#2563EB" />
+  </svg>
+);
+const OccludedFrontIcon = ({ className = 'w-4 h-4' }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <line x1="2" y1="15" x2="22" y2="15" stroke="#7C3AED" strokeWidth="2.2" strokeLinecap="round" />
+    <path d="M4 15a3.5 3.5 0 0 1 7 0Z" fill="#7C3AED" /><polygon points="13,15 16.5,8.5 20,15" fill="#7C3AED" />
+  </svg>
+);
+const TroughIcon = ({ className = 'w-4 h-4' }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <path d="M4 6c4 8 12 8 16 12" stroke="#B45309" strokeWidth="2.4" strokeLinecap="round" strokeDasharray="4 3" />
+  </svg>
+);
+const HighStampIcon = ({ className = 'w-4 h-4' }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <text x="12" y="17" textAnchor="middle" fill="#2563EB" fontSize="15" fontWeight="700" fontFamily="sans-serif">高</text>
+  </svg>
+);
+const LowStampIcon = ({ className = 'w-4 h-4' }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <text x="12" y="17" textAnchor="middle" fill="#DC2626" fontSize="15" fontWeight="700" fontFamily="sans-serif">低</text>
+  </svg>
+);
+const TyphoonStampIcon = ({ className = 'w-4 h-4' }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <circle cx="12" cy="12" r="4.5" stroke="#059669" strokeWidth="2" />
+    <path d="M14.5 8.2C17 6 19 4 20 2.5" stroke="#059669" strokeWidth="2" strokeLinecap="round" />
+    <path d="M9.5 15.8C7 18 5 20 4 21.5" stroke="#059669" strokeWidth="2" strokeLinecap="round" />
+  </svg>
+);
+const SunnyStampIcon = ({ className = 'w-4 h-4' }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <circle cx="12" cy="12" r="4.8" fill="#F97316" stroke="#EA580C" strokeWidth="1.2" />
+    <path d="M12 2.5v2.2M12 19.3v2.2M4.9 4.9l1.6 1.6M17.5 17.5l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.9 19.1l1.6-1.6M17.5 6.5l1.6-1.6" stroke="#F97316" strokeWidth="1.8" strokeLinecap="round" />
+  </svg>
+);
+const CloudyStampIcon = ({ className = 'w-4 h-4' }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <path d="M7 18h10.5a3.5 3.5 0 0 0 .5-6.96A5 5 0 0 0 8.2 9.5 3.8 3.8 0 0 0 7 18Z" fill="#94A3B8" stroke="#475569" strokeWidth="1.4" strokeLinejoin="round" />
+  </svg>
+);
+const PartlyCloudyStampIcon = ({ className = 'w-4 h-4' }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <circle cx="9" cy="9" r="3.6" fill="#F97316" />
+    <path d="M9 3v1.4M3.5 9H5M5.1 5.1l1 1M12.9 5.1l-1 1" stroke="#F97316" strokeWidth="1.5" strokeLinecap="round" />
+    <path d="M8.5 19h9a3 3 0 0 0 .4-5.97A4.2 4.2 0 0 0 9.6 11.8 3.2 3.2 0 0 0 8.5 19Z" fill="#E2E8F0" stroke="#475569" strokeWidth="1.4" strokeLinejoin="round" />
+  </svg>
+);
+const RainStampIcon = ({ className = 'w-4 h-4' }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <path d="M4 13a8 8 0 0 1 16 0Z" fill="#0284C7" stroke="#0369A1" strokeWidth="1.3" strokeLinejoin="round" />
+    <path d="M12 4v1.2M12 13v5.2a1.8 1.8 0 0 1-3.6 0" stroke="#0369A1" strokeWidth="1.6" strokeLinecap="round" />
+  </svg>
+);
+const SnowStampIcon = ({ className = 'w-4 h-4' }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <path d="M12 3v18M4.2 7.5l15.6 9M19.8 7.5l-15.6 9" stroke="#0EA5E9" strokeWidth="1.8" strokeLinecap="round" />
+    <circle cx="12" cy="12" r="2" fill="#FFFFFF" stroke="#0EA5E9" strokeWidth="1.4" />
+  </svg>
+);
+const ThunderStampIcon = ({ className = 'w-4 h-4' }) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <path d="M6.5 14h11a3 3 0 0 0 .4-5.97A4.4 4.4 0 0 0 9.3 6.8 3.3 3.3 0 0 0 6.5 14Z" fill="#64748B" stroke="#334155" strokeWidth="1.3" />
+    <polygon points="12.5,11.5 9.5,16.5 12,16.5 11,21 15,15.2 12.5,15.2" fill="#EAB308" stroke="#CA8A04" strokeWidth="0.6" />
+  </svg>
+);
+
+// === 5. TopBar ===
+const TopBar = ({ canUndo, canRedo, onUndo, onRedo, onSaveSnapshot, onLoadPreset, onClearCanvas, onOpenExport }) => {
+  const [presetOpen, setPresetOpen] = useState(false);
+  const menuRef = useRef(null);
+
+  useEffect(() => {
+    const handleClickOutside = (e) => {
+      if (menuRef.current && !menuRef.current.contains(e.target)) setPresetOpen(false);
+    };
+    if (presetOpen) document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [presetOpen]);
+
+  return (
+    <header className="h-14 bg-white border-b border-slate-200 px-5 flex items-center justify-between gap-8 shrink-0 z-30">
+      <span className="font-display text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0">
+        天気図スタジオ
+      </span>
+      <nav className="flex items-center gap-5 text-sm font-medium text-slate-600">
+        <div className="relative" ref={menuRef}>
+          <button
+            type="button"
+            onClick={() => setPresetOpen((v) => !v)}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-slate-700 hover:text-slate-900 hover:bg-slate-100 transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-sky-600"
+          >
+            <span>テンプレート</span>
+            <UiIcon name="chevronDown" className="w-3.5 h-3.5 text-slate-400" />
+          </button>
+          {presetOpen && (
+            <div className="absolute left-0 top-full mt-1.5 w-80 bg-white border border-slate-200 rounded-lg shadow-lg py-1.5 z-50">
+              <div className="px-3 py-1.5 text-xs font-medium text-slate-400 border-b border-slate-100">
+                気圧配置のテンプレートを読み込む
+              </div>
+              {CHART_PRESETS.map((preset) => (
+                <button
+                  key={preset.id}
+                  type="button"
+                  onClick={() => { onLoadPreset(preset); setPresetOpen(false); }}
+                  className="w-full text-left px-3 py-2.5 hover:bg-slate-50 transition-colors border-b border-slate-100 last:border-b-0"
+                >
+                  <div className="text-sm font-semibold text-slate-800">{preset.name}</div>
+                  <div className="text-xs text-slate-500 mt-0.5 leading-snug">{preset.subtitle}</div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        <button
+          type="button" onClick={onUndo} disabled={!canUndo} title="元に戻す (Ctrl+Z)"
+          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md hover:text-slate-900 hover:bg-slate-100 disabled:opacity-35 disabled:pointer-events-none transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-sky-600"
+        >
+          <UiIcon name="undo" /><span>元に戻す</span>
+        </button>
+        <button
+          type="button" onClick={onRedo} disabled={!canRedo} title="やり直し (Ctrl+Shift+Z)"
+          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md hover:text-slate-900 hover:bg-slate-100 disabled:opacity-35 disabled:pointer-events-none transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-sky-600"
+        >
+          <UiIcon name="redo" /><span>やり直し</span>
+        </button>
+        <button
+          type="button" onClick={onSaveSnapshot} title="現在の描画状態をブラウザ履歴に保存"
+          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-slate-700 hover:text-sky-700 hover:bg-sky-50 transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-sky-600"
+        >
+          <UiIcon name="bookmarkPlus" /><span>履歴を保存</span>
+        </button>
+        <button
+          type="button" onClick={onClearCanvas} title="すべてのレイヤーを白紙に戻す"
+          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-slate-600 hover:text-rose-700 hover:bg-rose-50 transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-sky-600"
+        >
+          <UiIcon name="filePlus" /><span>白紙にする</span>
+        </button>
+      </nav>
+      <div className="flex items-center shrink-0">
+        <button
+          type="button" onClick={onOpenExport}
+          className="flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-sky-700 hover:bg-sky-800 rounded-lg transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-600"
+        >
+          <UiIcon name="download" /><span>画像として保存</span>
+        </button>
+      </div>
+    </header>
+  );
+};
+
+// === 6. ToolSidebar ===
+const TOOL_GROUPS = [
+  {
+    title: '基本操作',
+    tools: [
+      { id: 'select', label: '選択・移動', icon: <UiIcon name="pointer" />, shortcut: 'V' },
+      { id: 'eraser', label: '消しゴム', icon: <UiIcon name="eraser" />, shortcut: 'E' },
+    ],
+  },
+  {
+    title: '等圧線・補助線',
+    tools: [
+      { id: 'isobar', label: '等圧線', icon: <IsobarIcon />, shortcut: 'I' },
+      { id: 'trough', label: '気圧の谷', icon: <TroughIcon /> },
+      { id: 'arrow', label: '進行矢印', icon: <UiIcon name="arrowUpRight" /> },
+      { id: 'pen', label: '自由ペン', icon: <UiIcon name="penTool" /> },
+    ],
+  },
+  {
+    title: '前線',
+    tools: [
+      { id: 'warm_front', label: '温暖前線', icon: <WarmFrontIcon /> },
+      { id: 'cold_front', label: '寒冷前線', icon: <ColdFrontIcon /> },
+      { id: 'stationary_front', label: '停滞前線', icon: <StationaryFrontIcon /> },
+      { id: 'occluded_front', label: '閉塞前線', icon: <OccludedFrontIcon /> },
+    ],
+  },
+  {
+    title: '気圧・注記スタンプ',
+    tools: [
+      { id: 'stamp_high', label: '高気圧', icon: <HighStampIcon /> },
+      { id: 'stamp_low', label: '低気圧', icon: <LowStampIcon /> },
+      { id: 'stamp_typhoon', label: '台風', icon: <TyphoonStampIcon /> },
+      { id: 'stamp_td', label: '熱帯低気圧', icon: <span className="text-xs font-bold text-sky-600">熱</span> },
+      { id: 'text', label: '文字メモ', icon: <UiIcon name="type" /> },
+    ],
+  },
+  {
+    title: '天気イラストスタンプ',
+    tools: [
+      { id: 'stamp_sunny', label: '晴れ', icon: <SunnyStampIcon /> },
+      { id: 'stamp_partly', label: '晴時々曇', icon: <PartlyCloudyStampIcon /> },
+      { id: 'stamp_cloudy', label: 'くもり', icon: <CloudyStampIcon /> },
+      { id: 'stamp_rain', label: '雨', icon: <RainStampIcon /> },
+      { id: 'stamp_snow', label: '雪', icon: <SnowStampIcon /> },
+      { id: 'stamp_thunder', label: '雷', icon: <ThunderStampIcon /> },
+    ],
+  },
+];
+
+const QUICK_PRESSURES = ['992', '996', '1000', '1004', '1008', '1012', '1016', '1020', '1024'];
+const QUICK_MOVEMENTS = ['ゆっくり', 'ほとんど停滞', '東 25km/h', '北東 35km/h', '北 20km/h'];
+const PEN_COLORS = ['#0F172A', '#DC2626', '#2563EB', '#059669', '#D97706', '#7C3AED'];
+
+const SelectedStrokeEditor = ({ item, onChange }) => {
+  const isFront = item.kind === 'warm_front' || item.kind === 'cold_front' || item.kind === 'stationary_front' || item.kind === 'occluded_front';
+  return (
+    <div className="space-y-3">
+      {item.kind === 'isobar' && (
+        <>
+          <div>
+            <label className="block text-xs font-medium text-slate-700 mb-1">気圧値ラベル (hPa)</label>
+            <input
+              type="text" value={item.pressureLabel ?? ''}
+              onChange={(e) => onChange({ pressureLabel: e.target.value })}
+              placeholder="空欄で非表示"
+              className="w-full px-2.5 py-1.5 text-sm font-mono-tabular border border-slate-200 rounded focus:outline-none focus:border-sky-500"
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-md">
+            <button type="button" onClick={() => onChange({ lineStyle: 'solid' })} className={`py-1 text-xs font-medium rounded ${item.lineStyle === 'solid' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'}`}>実線</button>
+            <button type="button" onClick={() => onChange({ lineStyle: 'dashed' })} className={`py-1 text-xs font-medium rounded ${item.lineStyle === 'dashed' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'}`}>破線</button>
+          </div>
+        </>
+      )}
+      {isFront && (
+        <button type="button" onClick={() => onChange({ flipSide: !item.flipSide })} className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-700">
+          <UiIcon name="arrowLeftRight" className="w-3.5 h-3.5" /><span>前線の向きを反転</span>
+        </button>
+      )}
+      <div>
+        <div className="flex justify-between text-xs text-slate-600 mb-1">
+          <span>線の太さ</span><span className="font-mono-tabular">{item.strokeWidth.toFixed(1)} px</span>
+        </div>
+        <input type="range" min={1.2} max={5} step={0.2} value={item.strokeWidth} onChange={(e) => onChange({ strokeWidth: Number(e.target.value) })} className="w-full accent-sky-700" />
+      </div>
+    </div>
+  );
+};
+
+const SelectedStampEditor = ({ item, onChange }) => (
+  <div className="space-y-3">
+    {item.kind === 'text' ? (
+      <div>
+        <label className="block text-xs font-medium text-slate-700 mb-1">テキスト内容</label>
+        <input type="text" value={item.text ?? ''} onChange={(e) => onChange({ text: e.target.value })} className="w-full px-2.5 py-1.5 text-sm border border-slate-200 rounded focus:outline-none focus:border-sky-500" />
+      </div>
+    ) : item.kind.startsWith('weather_') ? (
+      <div>
+        <label className="block text-xs font-medium text-slate-700 mb-1">添えるラベル（任意）</label>
+        <input type="text" value={item.text ?? ''} onChange={(e) => onChange({ text: e.target.value })} placeholder="例: 22℃ / 大雨" className="w-full px-2.5 py-1.5 text-xs border border-slate-200 rounded focus:outline-none focus:border-sky-500" />
+      </div>
+    ) : (
+      <>
+        <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-md">
+          <button type="button" onClick={() => onChange({ labelStyle: 'ja' })} className={`py-1 text-xs font-medium rounded ${item.labelStyle === 'ja' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'}`}>日本語 (高/低)</button>
+          <button type="button" onClick={() => onChange({ labelStyle: 'en' })} className={`py-1 text-xs font-medium rounded ${item.labelStyle === 'en' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'}`}>英語 (H/L)</button>
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-slate-700 mb-1">中心気圧 (hPa)</label>
+          <input type="text" value={item.pressure ?? ''} onChange={(e) => onChange({ pressure: e.target.value })} className="w-full px-2.5 py-1.5 text-sm font-mono-tabular border border-slate-200 rounded focus:outline-none focus:border-sky-500" />
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-slate-700 mb-1">移動・速度</label>
+          <input type="text" value={item.movementText ?? ''} onChange={(e) => onChange({ movementText: e.target.value })} className="w-full px-2.5 py-1.5 text-xs border border-slate-200 rounded focus:outline-none focus:border-sky-500" />
+        </div>
+      </>
+    )}
+    <div>
+      <div className="flex justify-between text-xs text-slate-600 mb-1">
+        <span>サイズ倍率</span><span className="font-mono-tabular">{item.scale.toFixed(2)}x</span>
+      </div>
+      <input type="range" min={0.6} max={1.8} step={0.05} value={item.scale} onChange={(e) => onChange({ scale: Number(e.target.value) })} className="w-full accent-sky-700" />
+    </div>
+  </div>
+);
+
+const ToolSidebar = ({ activeTool, onSelectTool, settings, onChangeSettings, selectedItem, onUpdateSelectedItem, onDeleteSelectedItem }) => {
+  const isFrontTool = activeTool === 'warm_front' || activeTool === 'cold_front' || activeTool === 'stationary_front' || activeTool === 'occluded_front';
+  const isStampTool = activeTool === 'stamp_high' || activeTool === 'stamp_low' || activeTool === 'stamp_typhoon' || activeTool === 'stamp_td';
+  const isWeatherIconTool = activeTool === 'stamp_sunny' || activeTool === 'stamp_cloudy' || activeTool === 'stamp_partly' || activeTool === 'stamp_rain' || activeTool === 'stamp_snow' || activeTool === 'stamp_thunder';
+
+  const adjustPressureValue = (current, delta) => {
+    const num = parseInt(current, 10);
+    return Number.isNaN(num) ? String(1012 + delta) : String(num + delta);
+  };
+
+  return (
+    <aside className="w-72 shrink-0 bg-white border-r border-slate-200 flex flex-col h-full overflow-y-auto">
+      <div className="p-4 space-y-4 border-b border-slate-200">
+        {TOOL_GROUPS.map((group) => (
+          <div key={group.title}>
+            <div className="text-xs font-semibold text-slate-500 mb-2">{group.title}</div>
+            <div className="grid grid-cols-2 gap-1.5">
+              {group.tools.map((t) => (
+                <button
+                  key={t.id} type="button" onClick={() => onSelectTool(t.id)}
+                  className={`flex items-center gap-2 px-2.5 py-2 rounded-md border text-xs font-medium transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-sky-600 ${
+                    activeTool === t.id ? 'bg-sky-50 border-sky-400 text-sky-900' : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
+                  }`}
+                >
+                  <span className="shrink-0 flex items-center justify-center w-4 h-4">{t.icon}</span>
+                  <span className="truncate">{t.label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="p-4 space-y-4 flex-1">
+        {selectedItem && activeTool === 'select' ? (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-slate-900">選択中のオブジェクト編集</span>
+              <button type="button" onClick={onDeleteSelectedItem} className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-rose-700 hover:bg-rose-50 rounded border border-rose-200 transition-colors whitespace-nowrap shrink-0">
+                <UiIcon name="trash" className="w-3.5 h-3.5" /><span>削除</span>
+              </button>
+            </div>
+            {selectedItem.itemType === 'stroke' && <SelectedStrokeEditor item={selectedItem} onChange={(patch) => onUpdateSelectedItem((prev) => ({ ...prev, ...patch }))} />}
+            {selectedItem.itemType === 'stamp' && <SelectedStampEditor item={selectedItem} onChange={(patch) => onUpdateSelectedItem((prev) => ({ ...prev, ...patch }))} />}
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div className="text-xs font-semibold text-slate-900">ツール詳細設定</div>
+
+            {activeTool === 'select' && (
+              <p className="text-xs text-slate-500 leading-relaxed">地図上の等圧線・前線・スタンプをクリックして選択し、ドラッグで移動やプロパティの編集ができます。</p>
+            )}
+
+            {activeTool === 'eraser' && (
+              <div className="space-y-3">
+                <p className="text-xs text-slate-500 leading-relaxed">消したい線やスタンプの上をなぞるかクリックして削除します。</p>
+                <div>
+                  <div className="flex justify-between text-xs text-slate-600 mb-1"><span>消しゴム半径</span><span className="font-mono-tabular">{settings.eraserRadius} px</span></div>
+                  <input type="range" min={8} max={40} step={2} value={settings.eraserRadius} onChange={(e) => onChangeSettings({ eraserRadius: Number(e.target.value) })} className="w-full accent-sky-700" />
+                </div>
+              </div>
+            )}
+
+            {activeTool === 'isobar' && (
+              <div className="space-y-3.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-medium text-slate-700">気圧値を表示 (hPa)</label>
+                  <input type="checkbox" checked={settings.showIsobarLabel} onChange={(e) => onChangeSettings({ showIsobarLabel: e.target.checked })} className="w-4 h-4 accent-sky-700 rounded" />
+                </div>
+                {settings.showIsobarLabel && (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-1.5">
+                      <button type="button" onClick={() => onChangeSettings({ isobarPressure: adjustPressureValue(settings.isobarPressure, -4) })} className="p-1.5 border border-slate-200 rounded hover:bg-slate-50 text-slate-600" title="-4 hPa">
+                        <UiIcon name="minus" className="w-3.5 h-3.5" />
+                      </button>
+                      <input type="text" value={settings.isobarPressure} onChange={(e) => onChangeSettings({ isobarPressure: e.target.value })} placeholder="1012" className="flex-1 px-2.5 py-1.5 text-sm font-mono-tabular border border-slate-200 rounded focus:outline-none focus:border-sky-500" />
+                      <button type="button" onClick={() => onChangeSettings({ isobarPressure: adjustPressureValue(settings.isobarPressure, 4) })} className="p-1.5 border border-slate-200 rounded hover:bg-slate-50 text-slate-600" title="+4 hPa">
+                        <UiIcon name="plus" className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-3 gap-1">
+                      {QUICK_PRESSURES.map((val) => (
+                        <button key={val} type="button" onClick={() => onChangeSettings({ isobarPressure: val })} className={`py-1 text-xs font-mono-tabular rounded border transition-colors ${settings.isobarPressure === val ? 'bg-sky-50 border-sky-400 text-sky-900 font-semibold' : 'border-slate-200 text-slate-600 hover:bg-slate-50'}`}>{val}</button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                <div>
+                  <div className="text-xs font-medium text-slate-700 mb-1.5">線種</div>
+                  <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-md">
+                    <button type="button" onClick={() => onChangeSettings({ lineStyle: 'solid' })} className={`py-1 text-xs font-medium rounded transition-colors ${settings.lineStyle === 'solid' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}>実線 (4hPa)</button>
+                    <button type="button" onClick={() => onChangeSettings({ lineStyle: 'dashed' })} className={`py-1 text-xs font-medium rounded transition-colors ${settings.lineStyle === 'dashed' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}>破線 (2hPa)</button>
+                  </div>
+                </div>
+                <div>
+                  <div className="flex justify-between text-xs text-slate-600 mb-1"><span>線の太さ</span><span className="font-mono-tabular">{settings.strokeWidth.toFixed(1)} px</span></div>
+                  <input type="range" min={1.2} max={4.5} step={0.2} value={settings.strokeWidth} onChange={(e) => onChangeSettings({ strokeWidth: Number(e.target.value) })} className="w-full accent-sky-700" />
+                </div>
+              </div>
+            )}
+
+            {isFrontTool && (
+              <div className="space-y-3.5">
+                <p className="text-xs text-slate-500 leading-relaxed">ドラッグして前線を描画します。半円や三角の向きが逆の場合は反転できます。</p>
+                <button type="button" onClick={() => onChangeSettings({ flipFrontSide: !settings.flipFrontSide })} className={`w-full flex items-center justify-center gap-2 py-2 px-3 rounded-md border text-xs font-semibold transition-colors ${settings.flipFrontSide ? 'bg-sky-50 border-sky-400 text-sky-900' : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'}`}>
+                  <UiIcon name="arrowLeftRight" className="w-3.5 h-3.5" /><span>記号の向きを反転</span>
+                </button>
+                <div>
+                  <div className="flex justify-between text-xs text-slate-600 mb-1"><span>記号サイズ</span><span className="font-mono-tabular">{settings.symbolSize} px</span></div>
+                  <input type="range" min={5} max={14} step={1} value={settings.symbolSize} onChange={(e) => onChangeSettings({ symbolSize: Number(e.target.value) })} className="w-full accent-sky-700" />
+                </div>
+                <div>
+                  <div className="flex justify-between text-xs text-slate-600 mb-1"><span>記号の間隔</span><span className="font-mono-tabular">{settings.symbolSpacing} px</span></div>
+                  <input type="range" min={20} max={52} step={2} value={settings.symbolSpacing} onChange={(e) => onChangeSettings({ symbolSpacing: Number(e.target.value) })} className="w-full accent-sky-700" />
+                </div>
+              </div>
+            )}
+
+            {(activeTool === 'trough' || activeTool === 'arrow' || activeTool === 'pen') && (
+              <div className="space-y-3.5">
+                <div>
+                  <div className="text-xs font-medium text-slate-700 mb-1.5">線の色</div>
+                  <div className="flex items-center gap-2">
+                    {PEN_COLORS.map((c) => (
+                      <button key={c} type="button" onClick={() => onChangeSettings({ penColor: c })} className={`w-6 h-6 rounded-full border transition-transform ${settings.penColor === c ? 'scale-110 ring-2 ring-sky-500 ring-offset-1 border-white' : 'border-slate-300'}`} style={{ backgroundColor: c }} aria-label={`Color ${c}`} />
+                    ))}
+                  </div>
+                </div>
+                {activeTool !== 'trough' && (
+                  <div>
+                    <div className="text-xs font-medium text-slate-700 mb-1.5">線種</div>
+                    <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-md">
+                      <button type="button" onClick={() => onChangeSettings({ lineStyle: 'solid' })} className={`py-1 text-xs font-medium rounded transition-colors ${settings.lineStyle === 'solid' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'}`}>実線</button>
+                      <button type="button" onClick={() => onChangeSettings({ lineStyle: 'dashed' })} className={`py-1 text-xs font-medium rounded transition-colors ${settings.lineStyle === 'dashed' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'}`}>破線</button>
+                    </div>
+                  </div>
+                )}
+                <div>
+                  <div className="flex justify-between text-xs text-slate-600 mb-1"><span>線の太さ</span><span className="font-mono-tabular">{settings.strokeWidth.toFixed(1)} px</span></div>
+                  <input type="range" min={1.4} max={5} step={0.2} value={settings.strokeWidth} onChange={(e) => onChangeSettings({ strokeWidth: Number(e.target.value) })} className="w-full accent-sky-700" />
+                </div>
+              </div>
+            )}
+
+            {isStampTool && (
+              <div className="space-y-3.5">
+                <p className="text-xs text-slate-500 leading-relaxed">地図上の配置したい地点をクリックしてスタンプを貼り付けます。</p>
+                <div>
+                  <div className="text-xs font-medium text-slate-700 mb-1.5">記号の表記</div>
+                  <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-md">
+                    <button type="button" onClick={() => onChangeSettings({ stampLabelStyle: 'ja' })} className={`py-1 text-xs font-medium rounded transition-colors ${settings.stampLabelStyle === 'ja' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'}`}>高 / 低 / 台</button>
+                    <button type="button" onClick={() => onChangeSettings({ stampLabelStyle: 'en' })} className={`py-1 text-xs font-medium rounded transition-colors ${settings.stampLabelStyle === 'en' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'}`}>H / L / T</button>
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">中心気圧 (hPa・任意)</label>
+                  <div className="flex items-center gap-1.5">
+                    <button type="button" onClick={() => onChangeSettings({ stampPressure: adjustPressureValue(settings.stampPressure || '1000', -2) })} className="p-1.5 border border-slate-200 rounded hover:bg-slate-50 text-slate-600">
+                      <UiIcon name="minus" className="w-3.5 h-3.5" />
+                    </button>
+                    <input type="text" value={settings.stampPressure} onChange={(e) => onChangeSettings({ stampPressure: e.target.value })} placeholder="例: 1024" className="flex-1 px-2.5 py-1.5 text-sm font-mono-tabular border border-slate-200 rounded focus:outline-none focus:border-sky-500" />
+                    <button type="button" onClick={() => onChangeSettings({ stampPressure: adjustPressureValue(settings.stampPressure || '1000', 2) })} className="p-1.5 border border-slate-200 rounded hover:bg-slate-50 text-slate-600">
+                      <UiIcon name="plus" className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">移動方向・速度 (任意)</label>
+                  <input type="text" value={settings.stampMovement} onChange={(e) => onChangeSettings({ stampMovement: e.target.value })} placeholder="例: 北東 30km/h" className="w-full px-2.5 py-1.5 text-xs border border-slate-200 rounded focus:outline-none focus:border-sky-500 mb-1.5" />
+                  <div className="flex flex-wrap gap-1">
+                    {QUICK_MOVEMENTS.map((mv) => (
+                      <button key={mv} type="button" onClick={() => onChangeSettings({ stampMovement: settings.stampMovement === mv ? '' : mv })} className={`px-2 py-0.5 text-[11px] rounded border transition-colors ${settings.stampMovement === mv ? 'bg-sky-50 border-sky-400 text-sky-900' : 'border-slate-200 text-slate-600 hover:bg-slate-50'}`}>{mv}</button>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <div className="flex justify-between text-xs text-slate-600 mb-1"><span>スタンプ倍率</span><span className="font-mono-tabular">{settings.stampScale.toFixed(2)}x</span></div>
+                  <input type="range" min={0.7} max={1.6} step={0.05} value={settings.stampScale} onChange={(e) => onChangeSettings({ stampScale: Number(e.target.value) })} className="w-full accent-sky-700" />
+                </div>
+              </div>
+            )}
+
+            {isWeatherIconTool && (
+              <div className="space-y-3.5">
+                <p className="text-xs text-slate-500 leading-relaxed">地図上の配置したい地点をクリックして天気マークを貼り付けます。</p>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">添えるラベル（気温・地域など任意）</label>
+                  <input type="text" value={settings.weatherCaption} onChange={(e) => onChangeSettings({ weatherCaption: e.target.value })} placeholder="例: 22℃ / 大雨注意" className="w-full px-2.5 py-1.5 text-xs border border-slate-200 rounded focus:outline-none focus:border-sky-500" />
+                </div>
+                <div>
+                  <div className="flex justify-between text-xs text-slate-600 mb-1"><span>スタンプ倍率</span><span className="font-mono-tabular">{settings.stampScale.toFixed(2)}x</span></div>
+                  <input type="range" min={0.7} max={1.8} step={0.05} value={settings.stampScale} onChange={(e) => onChangeSettings({ stampScale: Number(e.target.value) })} className="w-full accent-sky-700" />
+                </div>
+              </div>
+            )}
+
+            {activeTool === 'text' && (
+              <div className="space-y-3.5">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">配置する文字</label>
+                  <input type="text" value={settings.textValue} onChange={(e) => onChangeSettings({ textValue: e.target.value })} placeholder="例: 寒冷渦 / 前線停滞" className="w-full px-2.5 py-1.5 text-sm border border-slate-200 rounded focus:outline-none focus:border-sky-500" />
+                </div>
+                <div>
+                  <div className="text-xs font-medium text-slate-700 mb-1.5">文字色</div>
+                  <div className="flex items-center gap-2">
+                    {PEN_COLORS.map((c) => (
+                      <button key={c} type="button" onClick={() => onChangeSettings({ textColor: c })} className={`w-6 h-6 rounded-full border transition-transform ${settings.textColor === c ? 'scale-110 ring-2 ring-sky-500 ring-offset-1 border-white' : 'border-slate-300'}`} style={{ backgroundColor: c }} aria-label={`Text color ${c}`} />
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </aside>
+  );
+};
+
+// === 7. WeatherCanvas ===
+function makeItemId(prefix) {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+}
+
+function toolToStrokeKind(tool) {
+  switch (tool) {
+    case 'isobar': case 'warm_front': case 'cold_front': case 'stationary_front':
+    case 'occluded_front': case 'trough': case 'arrow': case 'pen':
+      return tool;
+    default:
+      return null;
+  }
+}
+
+const STAMP_KIND_MAP = {
+  stamp_high: 'high', stamp_low: 'low', stamp_typhoon: 'typhoon', stamp_td: 'td',
+  stamp_sunny: 'weather_sunny', stamp_cloudy: 'weather_cloudy', stamp_partly: 'weather_partly',
+  stamp_rain: 'weather_rain', stamp_snow: 'weather_snow', stamp_thunder: 'weather_thunder', text: 'text',
+};
+const STAMP_COLOR_MAP = {
+  high: '#2563EB', low: '#DC2626', typhoon: '#059669', td: '#0284C7',
+  weather_sunny: '#EA580C', weather_cloudy: '#64748B', weather_partly: '#EA580C',
+  weather_rain: '#0284C7', weather_snow: '#0284C7', weather_thunder: '#64748B',
+};
+const STAMP_LABEL_NAMES = {
+  high: '高気圧スタンプを追加', low: '低気圧スタンプを追加', typhoon: '台風スタンプを追加',
+  td: '熱帯低気圧スタンプを追加', weather_sunny: '晴れスタンプを追加', weather_cloudy: 'くもりスタンプを追加',
+  weather_partly: '晴時々曇スタンプを追加', weather_rain: '雨スタンプを追加',
+  weather_snow: '雪スタンプを追加', weather_thunder: '雷スタンプを追加', text: 'テキストメモを追加',
+};
+
+const WeatherCanvas = ({
+  documentState, activeTool, settings, selectedItemId, mapVersion,
+  onSelectItem, onAddItem, onEraseItems, onMoveItemFinish, onUnlockOrShowActiveLayer,
+}) => {
+  const containerRef = useRef(null);
+  const canvasRef = useRef(null);
+  const [zoom, setZoom] = useState(1);
+  const [fitScale, setFitScale] = useState(0.8);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [spacePressed, setSpacePressed] = useState(false);
+  const [handPanMode, setHandPanMode] = useState(false);
+  const [cursorGeo, setCursorGeo] = useState(null);
+  const [hoverChartPt, setHoverChartPt] = useState(null);
+  const [previewStroke, setPreviewStroke] = useState(null);
+  const [liveMoveDelta, setLiveMoveDelta] = useState(null);
+
+  const gestureRef = useRef({
+    mode: 'none', startScreenX: 0, startScreenY: 0, startPanX: 0, startPanY: 0,
+    rawPoints: [], moveItemId: null, moveStartChart: { x: 0, y: 0 }, moveOffset: { x: 0, y: 0 },
+    erasedIds: new Set(),
+  });
+
+  const activeLayer = documentState.layers.find((l) => l.id === documentState.activeLayerId);
+  const isActiveLayerBlocked = !activeLayer || !activeLayer.visible || activeLayer.locked;
+
+  useEffect(() => {
+    const updateFit = () => {
+      if (!containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      const pad = 40;
+      const nextFit = Math.max(0.25, Math.min(1.3, Math.min((rect.width - pad) / CHART_WIDTH, (rect.height - pad) / CHART_HEIGHT)));
+      setFitScale(nextFit);
+    };
+    updateFit();
+    const obs = new ResizeObserver(updateFit);
+    if (containerRef.current) obs.observe(containerRef.current);
+    return () => obs.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (e.code === 'Space' && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
+        e.preventDefault();
+        setSpacePressed(true);
+      }
+    };
+    const onKeyUp = (e) => { if (e.code === 'Space') setSpacePressed(false); };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+    };
+  }, []);
+
+  const effectiveScale = fitScale * zoom;
+
+  const clientToChartPoint = useCallback((clientX, clientY) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: ((clientX - rect.left) / rect.width) * CHART_WIDTH,
+      y: ((clientY - rect.top) / rect.height) * CHART_HEIGHT,
+    };
+  }, []);
+
+  const renderNow = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const targetW = Math.round(CHART_WIDTH * dpr), targetH = Math.round(CHART_HEIGHT * dpr);
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW;
+      canvas.height = targetH;
+    }
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    let stateToDraw = documentState;
+    if (liveMoveDelta) {
+      stateToDraw = {
+        ...documentState,
+        layers: documentState.layers.map((layer) => ({
+          ...layer,
+          items: layer.items.map((item) => {
+            if (item.id !== liveMoveDelta.id) return item;
+            if (item.itemType === 'stamp') return { ...item, x: item.x + liveMoveDelta.dx, y: item.y + liveMoveDelta.dy };
+            return { ...item, points: item.points.map((p) => ({ x: p.x + liveMoveDelta.dx, y: p.y + liveMoveDelta.dy })) };
+          }),
+        })),
+      };
+    }
+
+    ctx.clearRect(0, 0, targetW, targetH);
+    renderWeatherChart(ctx, stateToDraw, { selectedItemId, previewStroke, scale: dpr });
+
+    if (hoverChartPt && !spacePressed && !handPanMode) {
+      ctx.save();
+      ctx.scale(dpr, dpr);
+      if (activeTool === 'eraser') {
+        ctx.beginPath();
+        ctx.arc(hoverChartPt.x, hoverChartPt.y, settings.eraserRadius, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(225, 29, 72, 0.85)';
+        ctx.fillStyle = 'rgba(225, 29, 72, 0.1)';
+        ctx.lineWidth = 1.5;
+        ctx.fill();
+        ctx.stroke();
+      } else if (activeTool !== 'text' && STAMP_KIND_MAP[activeTool]) {
+        const kind = STAMP_KIND_MAP[activeTool];
+        const isWeatherIcon = kind.startsWith('weather_');
+        const ghost = {
+          id: 'ghost', itemType: 'stamp', kind, x: hoverChartPt.x, y: hoverChartPt.y,
+          labelStyle: settings.stampLabelStyle,
+          pressure: isWeatherIcon ? undefined : settings.stampPressure,
+          movementText: isWeatherIcon ? undefined : settings.stampMovement,
+          text: isWeatherIcon ? settings.weatherCaption || undefined : undefined,
+          color: STAMP_COLOR_MAP[kind], scale: settings.stampScale,
+        };
+        ctx.globalAlpha = 0.55;
+        renderStampItem(ctx, ghost, documentState.baseMap, false);
+      }
+      ctx.restore();
+    }
+  }, [documentState, selectedItemId, previewStroke, liveMoveDelta, hoverChartPt, activeTool, settings, spacePressed, handPanMode, mapVersion]);
+
+  useEffect(() => { renderNow(); }, [renderNow]);
+
+  const buildStrokeFromPoints = (points, kind) => {
+    const colorMap = {
+      isobar: '#AUTO', warm_front: '#DC2626', cold_front: '#2563EB',
+      stationary_front: '#DC2626', occluded_front: '#7C3AED',
+      trough: settings.penColor === '#0F172A' ? '#B45309' : settings.penColor,
+      arrow: settings.penColor, pen: settings.penColor,
+    };
+    const isFront = kind === 'warm_front' || kind === 'cold_front' || kind === 'stationary_front' || kind === 'occluded_front';
+    return {
+      id: makeItemId('str'), itemType: 'stroke', kind, points, color: colorMap[kind],
+      strokeWidth: isFront ? Math.max(2.2, settings.strokeWidth) : settings.strokeWidth,
+      lineStyle: kind === 'trough' ? 'dashed' : settings.lineStyle,
+      flipSide: settings.flipFrontSide,
+      pressureLabel: kind === 'isobar' && settings.showIsobarLabel ? settings.isobarPressure : undefined,
+      symbolSpacing: settings.symbolSpacing, symbolSize: settings.symbolSize,
+    };
+  };
+
+  const findTopItemAt = (pt, tolerance = 14) => {
+    for (let li = documentState.layers.length - 1; li >= 0; li--) {
+      const layer = documentState.layers[li];
+      if (!layer.visible || layer.locked) continue;
+      for (let ii = layer.items.length - 1; ii >= 0; ii--) {
+        const item = layer.items[ii];
+        if (hitTestItem(item, pt, tolerance)) return { item, layerId: layer.id };
+      }
+    }
+    return null;
+  };
+
+  const handlePointerDown = (e) => {
+    e.currentTarget.setPointerCapture(e.pointerId);
+    if (spacePressed || handPanMode || e.button === 1) {
+      gestureRef.current = { ...gestureRef.current, mode: 'pan', startScreenX: e.clientX, startScreenY: e.clientY, startPanX: pan.x, startPanY: pan.y };
+      return;
+    }
+    if (e.button !== 0) return;
+    const pt = clientToChartPoint(e.clientX, e.clientY);
+    if (!pt) return;
+
+    if (activeTool === 'select') {
+      const hit = findTopItemAt(pt, 14);
+      if (hit) {
+        onSelectItem(hit.item.id, hit.layerId);
+        gestureRef.current = { ...gestureRef.current, mode: 'move', moveItemId: hit.item.id, moveStartChart: pt, moveOffset: { x: 0, y: 0 } };
+      } else {
+        onSelectItem(null);
+      }
+      return;
+    }
+
+    if (activeTool === 'eraser') {
+      const erased = new Set();
+      for (const layer of documentState.layers) {
+        if (!layer.visible || layer.locked) continue;
+        for (const item of layer.items) {
+          if (hitTestItem(item, pt, settings.eraserRadius)) erased.add(item.id);
+        }
+      }
+      gestureRef.current = { ...gestureRef.current, mode: 'erase', erasedIds: erased };
+      if (erased.size > 0) onEraseItems(Array.from(erased));
+      return;
+    }
+
+    if (isActiveLayerBlocked) return;
+
+    if (STAMP_KIND_MAP[activeTool]) {
+      const kind = STAMP_KIND_MAP[activeTool];
+      const isWeatherIcon = kind.startsWith('weather_');
+      const newStamp = {
+        id: makeItemId('st'), itemType: 'stamp', kind, x: pt.x, y: pt.y,
+        labelStyle: settings.stampLabelStyle,
+        pressure: kind === 'text' || isWeatherIcon ? undefined : settings.stampPressure,
+        movementText: kind === 'text' || isWeatherIcon ? undefined : settings.stampMovement,
+        text: kind === 'text' ? settings.textValue || 'メモ' : isWeatherIcon ? settings.weatherCaption || undefined : undefined,
+        color: kind === 'text' ? settings.textColor : STAMP_COLOR_MAP[kind],
+        scale: settings.stampScale,
+      };
+      onAddItem(newStamp, STAMP_LABEL_NAMES[kind]);
+      return;
+    }
+
+    const strokeKind = toolToStrokeKind(activeTool);
+    if (strokeKind) {
+      gestureRef.current = { ...gestureRef.current, mode: 'draw', rawPoints: [pt] };
+      setPreviewStroke(buildStrokeFromPoints([pt, pt], strokeKind));
+    }
+  };
+
+  const handlePointerMove = (e) => {
+    const pt = clientToChartPoint(e.clientX, e.clientY);
+    if (pt) {
+      setHoverChartPt(pt);
+      setCursorGeo(unprojectXY(pt.x, pt.y));
+    }
+    const g = gestureRef.current;
+    if (g.mode === 'pan') {
+      setPan({ x: g.startPanX + (e.clientX - g.startScreenX), y: g.startPanY + (e.clientY - g.startScreenY) });
+      return;
+    }
+    if (!pt) return;
+    if (g.mode === 'move' && g.moveItemId) {
+      const dx = pt.x - g.moveStartChart.x, dy = pt.y - g.moveStartChart.y;
+      g.moveOffset = { x: dx, y: dy };
+      setLiveMoveDelta({ id: g.moveItemId, dx, dy });
+      return;
+    }
+    if (g.mode === 'erase') {
+      const newlyHit = [];
+      for (const layer of documentState.layers) {
+        if (!layer.visible || layer.locked) continue;
+        for (const item of layer.items) {
+          if (!g.erasedIds.has(item.id) && hitTestItem(item, pt, settings.eraserRadius)) {
+            g.erasedIds.add(item.id);
+            newlyHit.push(item.id);
+          }
+        }
+      }
+      if (newlyHit.length > 0) onEraseItems(newlyHit);
+      return;
+    }
+    if (g.mode === 'draw') {
+      const last = g.rawPoints[g.rawPoints.length - 1];
+      if (!last || Math.hypot(pt.x - last.x, pt.y - last.y) >= 3) {
+        g.rawPoints.push(pt);
+        const strokeKind = toolToStrokeKind(activeTool);
+        if (strokeKind) setPreviewStroke(buildStrokeFromPoints(smoothPolyline(g.rawPoints, 5), strokeKind));
+      }
+    }
+  };
+
+  const handlePointerUp = (e) => {
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
+    const g = gestureRef.current;
+    if (g.mode === 'move' && g.moveItemId) {
+      const { x: dx, y: dy } = g.moveOffset;
+      setLiveMoveDelta(null);
+      if (Math.hypot(dx, dy) > 2) onMoveItemFinish(g.moveItemId, dx, dy);
+    } else if (g.mode === 'draw') {
+      const strokeKind = toolToStrokeKind(activeTool);
+      if (strokeKind && g.rawPoints.length >= 2) {
+        let totalDist = 0;
+        for (let i = 1; i < g.rawPoints.length; i++) {
+          totalDist += Math.hypot(g.rawPoints[i].x - g.rawPoints[i - 1].x, g.rawPoints[i].y - g.rawPoints[i - 1].y);
+        }
+        if (totalDist >= 10) {
+          const item = buildStrokeFromPoints(smoothPolyline(g.rawPoints, 6), strokeKind);
+          const labelMap = {
+            isobar: '等圧線を描画', warm_front: '温暖前線を描画', cold_front: '寒冷前線を描画',
+            stationary_front: '停滞前線を描画', occluded_front: '閉塞前線を描画',
+            trough: '気圧の谷を描画', arrow: '進行矢印を描画', pen: '自由線を描画',
+          };
+          onAddItem(item, labelMap[strokeKind]);
+        }
+      }
+      setPreviewStroke(null);
+    }
+    gestureRef.current.mode = 'none';
+    gestureRef.current.rawPoints = [];
+    gestureRef.current.moveItemId = null;
+    gestureRef.current.erasedIds = new Set();
+  };
+
+  const handleWheel = (e) => {
+    if (e.ctrlKey || e.metaKey || Math.abs(e.deltaY) > 0) {
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.08 : 0.92;
+      setZoom((z) => Math.max(0.5, Math.min(3.0, Number((z * factor).toFixed(2)))));
+    }
+  };
+
+  const cursorClass = spacePressed || handPanMode
+    ? gestureRef.current.mode === 'pan' ? 'cursor-grabbing' : 'cursor-grab'
+    : activeTool === 'select' ? 'cursor-default' : 'cursor-crosshair';
+
+  return (
+    <div ref={containerRef} onWheel={handleWheel} className="flex-1 bg-slate-100 relative overflow-hidden flex items-center justify-center select-none">
+      {isActiveLayerBlocked && activeTool !== 'select' && activeTool !== 'eraser' && (
+        <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-3 px-3.5 py-2 bg-white border border-amber-300 rounded-lg shadow-sm text-xs text-slate-800">
+          {activeLayer && !activeLayer.visible ? (
+            <><UiIcon name="eyeOff" className="w-3.5 h-3.5 text-amber-600 shrink-0" /><span>選択中のレイヤー「{activeLayer.name}」は非表示です</span></>
+          ) : (
+            <><UiIcon name="lock" className="w-3.5 h-3.5 text-amber-600 shrink-0" /><span>選択中のレイヤー「{activeLayer ? activeLayer.name : ''}」はロックされています</span></>
+          )}
+          <button type="button" onClick={onUnlockOrShowActiveLayer} className="px-2 py-1 rounded bg-amber-100 hover:bg-amber-200 text-amber-900 font-semibold transition-colors whitespace-nowrap">
+            描画可能にする
+          </button>
+        </div>
+      )}
+
+      <div
+        style={{
+          transform: `translate(${pan.x}px, ${pan.y}px)`,
+          width: `${Math.round(CHART_WIDTH * effectiveScale)}px`,
+          height: `${Math.round(CHART_HEIGHT * effectiveScale)}px`,
+        }}
+        className="shadow-sm border border-slate-300 bg-white shrink-0"
+      >
+        <canvas
+          ref={canvasRef}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerLeave={() => { setHoverChartPt(null); setCursorGeo(null); }}
+          style={{ width: '100%', height: '100%' }}
+          className={`block touch-none ${cursorClass}`}
+        />
+      </div>
+
+      <div className="absolute bottom-3 left-4 pointer-events-none flex items-center gap-2 text-xs font-mono-tabular text-slate-600 bg-white/85 backdrop-blur-sm px-2.5 py-1 rounded border border-slate-200">
+        <span>{cursorGeo ? `${cursorGeo.lat.toFixed(2)}°N · ${cursorGeo.lon.toFixed(2)}°E` : '日本周辺域'}</span>
+        <span aria-hidden="true" className="text-slate-300">|</span>
+        <span>描画先: {activeLayer ? activeLayer.name : '—'}</span>
+      </div>
+
+      <div className="absolute bottom-3 right-4 flex items-center gap-1 bg-white border border-slate-200 rounded-lg p-1 shadow-sm">
+        <button type="button" onClick={() => setHandPanMode((v) => !v)} title="画面移動モード (または Space+ドラッグ)" className={`p-1.5 rounded transition-colors ${handPanMode ? 'bg-sky-50 text-sky-700' : 'text-slate-600 hover:bg-slate-100'}`}>
+          <UiIcon name="hand" />
+        </button>
+        <div className="w-px h-4 bg-slate-200 mx-0.5" />
+        <button type="button" onClick={() => setZoom((z) => Math.max(0.5, Number((z - 0.15).toFixed(2))))} title="縮小" className="p-1.5 rounded text-slate-600 hover:bg-slate-100 transition-colors">
+          <UiIcon name="zoomOut" />
+        </button>
+        <span className="px-1.5 text-xs font-mono-tabular text-slate-700 min-w-[46px] text-center">{Math.round(zoom * 100)}%</span>
+        <button type="button" onClick={() => setZoom((z) => Math.min(3.0, Number((z + 0.15).toFixed(2))))} title="拡大" className="p-1.5 rounded text-slate-600 hover:bg-slate-100 transition-colors">
+          <UiIcon name="zoomIn" />
+        </button>
+        <button type="button" onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }} title="全体表示に戻す" className="p-1.5 rounded text-slate-600 hover:bg-slate-100 transition-colors">
+          <UiIcon name="maximize" />
+        </button>
+      </div>
+    </div>
+  );
+};
+
+// === 8. RightPanel ===
+const THEME_OPTIONS = [
+  { id: 'broadcast', label: '放送局風' },
+  { id: 'jma_classic', label: '気象庁風' },
+  { id: 'monochrome', label: 'モノクロ' },
+  { id: 'night', label: 'ナイト' },
+];
+
+function formatTime(ts) {
+  const d = new Date(ts);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
+}
+function formatShortDate(ts) {
+  const d = new Date(ts);
+  return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+const RightPanel = ({
+  layers, activeLayerId, baseMap, history, historyIndex, snapshots,
+  onSelectLayer, onAddLayer, onDeleteLayer, onRenameLayer, onToggleLayerVisibility,
+  onToggleLayerLock, onChangeLayerOpacity, onMoveLayer, onChangeBaseMap,
+  onJumpToHistory, onSaveNamedSnapshot, onRestoreSnapshot, onDeleteSnapshot,
+}) => {
+  const [tab, setTab] = useState('layers');
+  const [editingLayerId, setEditingLayerId] = useState(null);
+  const [editingName, setEditingName] = useState('');
+  const [snapshotNameInput, setSnapshotNameInput] = useState('');
+
+  const activeLayer = layers.find((l) => l.id === activeLayerId);
+  const displayLayers = [...layers].reverse();
+
+  const handleCommitRename = () => {
+    if (editingLayerId && editingName.trim()) onRenameLayer(editingLayerId, editingName.trim());
+    setEditingLayerId(null);
+  };
+
+  const handleCreateSnapshot = (e) => {
+    e.preventDefault();
+    onSaveNamedSnapshot(snapshotNameInput.trim());
+    setSnapshotNameInput('');
+  };
+
+  return (
+    <aside className="w-80 shrink-0 bg-white border-l border-slate-200 flex flex-col h-full">
+      <div className="p-3 border-b border-slate-200">
+        <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-lg">
+          <button
+            type="button" onClick={() => setTab('layers')}
+            className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap ${
+              tab === 'layers' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <UiIcon name="layers" className="w-3.5 h-3.5" /><span>レイヤー・地図</span>
+          </button>
+          <button
+            type="button" onClick={() => setTab('history')}
+            className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap ${
+              tab === 'history' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <UiIcon name="history" className="w-3.5 h-3.5" /><span>履歴・復元</span>
+          </button>
+        </div>
+      </div>
+
+      {tab === 'layers' ? (
+        <div className="flex-1 overflow-y-auto divide-y divide-slate-200">
+          <div className="p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <h2 className="text-xs font-semibold text-slate-900">描画レイヤー</h2>
+              <button type="button" onClick={onAddLayer} className="flex items-center gap-1 px-2 py-1 text-xs font-semibold text-sky-700 hover:bg-sky-50 rounded border border-sky-200 transition-colors whitespace-nowrap">
+                <UiIcon name="plus" className="w-3.5 h-3.5" /><span>レイヤー追加</span>
+              </button>
+            </div>
+
+            <div className="space-y-1.5">
+              {displayLayers.map((layer) => {
+                const isActive = layer.id === activeLayerId;
+                const realIdx = layers.findIndex((l) => l.id === layer.id);
+                const isTop = realIdx === layers.length - 1;
+                const isBottom = realIdx === 0;
+                return (
+                  <div
+                    key={layer.id} onClick={() => onSelectLayer(layer.id)}
+                    className={`group flex items-center gap-1.5 px-2.5 py-2 rounded-md border cursor-pointer transition-colors ${
+                      isActive ? 'bg-sky-50/80 border-sky-300' : 'bg-white border-slate-200 hover:bg-slate-50'
+                    }`}
+                  >
+                    <button type="button" onClick={(e) => { e.stopPropagation(); onToggleLayerVisibility(layer.id); }} title={layer.visible ? '非表示にする' : '表示する'} className="p-1 rounded text-slate-500 hover:text-slate-900 hover:bg-slate-100">
+                      <UiIcon name={layer.visible ? 'eye' : 'eyeOff'} className={`w-3.5 h-3.5 ${layer.visible ? '' : 'text-slate-300'}`} />
+                    </button>
+                    <button type="button" onClick={(e) => { e.stopPropagation(); onToggleLayerLock(layer.id); }} title={layer.locked ? 'ロック解除' : 'ロックする'} className="p-1 rounded text-slate-500 hover:text-slate-900 hover:bg-slate-100">
+                      <UiIcon name={layer.locked ? 'lock' : 'unlock'} className={`w-3.5 h-3.5 ${layer.locked ? 'text-amber-600' : 'text-slate-300'}`} />
+                    </button>
+                    <div className="flex-1 min-w-0" onDoubleClick={(e) => { e.stopPropagation(); setEditingLayerId(layer.id); setEditingName(layer.name); }}>
+                      {editingLayerId === layer.id ? (
+                        <input
+                          type="text" value={editingName} autoFocus
+                          onChange={(e) => setEditingName(e.target.value)}
+                          onBlur={handleCommitRename}
+                          onKeyDown={(e) => { if (e.key === 'Enter') handleCommitRename(); if (e.key === 'Escape') setEditingLayerId(null); }}
+                          onClick={(e) => e.stopPropagation()}
+                          className="w-full px-1.5 py-0.5 text-xs border border-sky-400 rounded bg-white focus:outline-none"
+                        />
+                      ) : (
+                        <div className="flex items-center justify-between gap-2">
+                          <span className={`text-xs truncate ${isActive ? 'font-semibold text-sky-950' : 'font-medium text-slate-700'}`}>{layer.name}</span>
+                          <span className="text-[11px] font-mono-tabular text-slate-400 shrink-0">{layer.items.length}</span>
+                        </div>
+                      )}
+                    </div>
+                    <div className="flex items-center opacity-70 group-hover:opacity-100">
+                      <button type="button" disabled={isTop} onClick={(e) => { e.stopPropagation(); onMoveLayer(layer.id, 'up'); }} title="上へ移動" className="p-1 rounded text-slate-500 hover:text-slate-900 disabled:opacity-25">
+                        <UiIcon name="arrowUp" className="w-3 h-3" />
+                      </button>
+                      <button type="button" disabled={isBottom} onClick={(e) => { e.stopPropagation(); onMoveLayer(layer.id, 'down'); }} title="下へ移動" className="p-1 rounded text-slate-500 hover:text-slate-900 disabled:opacity-25">
+                        <UiIcon name="arrowDown" className="w-3 h-3" />
+                      </button>
+                      {layers.length > 1 && (
+                        <button type="button" onClick={(e) => { e.stopPropagation(); onDeleteLayer(layer.id); }} title="レイヤーを削除" className="p-1 rounded text-slate-400 hover:text-rose-600">
+                          <UiIcon name="trash" className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {activeLayer && (
+              <div className="pt-2">
+                <div className="flex justify-between text-xs text-slate-600 mb-1">
+                  <span>「{activeLayer.name}」の不透明度</span>
+                  <span className="font-mono-tabular">{Math.round(activeLayer.opacity * 100)}%</span>
+                </div>
+                <input type="range" min={0.1} max={1} step={0.05} value={activeLayer.opacity} onChange={(e) => onChangeLayerOpacity(activeLayer.id, Number(e.target.value))} className="w-full accent-sky-700" />
+              </div>
+            )}
+          </div>
+
+          <div className="p-4 space-y-3.5">
+            <h2 className="text-xs font-semibold text-slate-900">背景地図（日本周辺）</h2>
+            <div>
+              <div className="text-xs text-slate-600 mb-1.5">配色テーマ</div>
+              <div className="grid grid-cols-2 gap-1.5">
+                {THEME_OPTIONS.map((t) => (
+                  <button
+                    key={t.id} type="button" onClick={() => onChangeBaseMap({ theme: t.id })}
+                    className={`py-1.5 px-2 text-xs font-medium rounded border transition-colors ${
+                      baseMap.theme === t.id ? 'bg-sky-50 border-sky-400 text-sky-900 font-semibold' : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                    }`}
+                  >{t.label}</button>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-2 text-xs">
+              <label className="flex items-center justify-between text-slate-700 cursor-pointer">
+                <span>緯線・経線グリッド</span>
+                <input type="checkbox" checked={baseMap.showGrid} onChange={(e) => onChangeBaseMap({ showGrid: e.target.checked })} className="w-4 h-4 accent-sky-700 rounded" />
+              </label>
+              <label className="flex items-center justify-between text-slate-700 cursor-pointer">
+                <span>国境線</span>
+                <input type="checkbox" checked={baseMap.showBorders} onChange={(e) => onChangeBaseMap({ showBorders: e.target.checked })} className="w-4 h-4 accent-sky-700 rounded" />
+              </label>
+              <label className="flex items-center justify-between text-slate-700 cursor-pointer">
+                <span>主要都市名</span>
+                <input type="checkbox" checked={baseMap.showCities} onChange={(e) => onChangeBaseMap({ showCities: e.target.checked })} className="w-4 h-4 accent-sky-700 rounded" />
+              </label>
+              <label className="flex items-center justify-between text-slate-700 cursor-pointer">
+                <span>天気図タイトル枠</span>
+                <input type="checkbox" checked={baseMap.showChartHeader} onChange={(e) => onChangeBaseMap({ showChartHeader: e.target.checked })} className="w-4 h-4 accent-sky-700 rounded" />
+              </label>
+            </div>
+
+            {baseMap.showChartHeader && (
+              <div className="space-y-2 pt-1">
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-500 mb-1">見出しタイトル</label>
+                  <input type="text" value={baseMap.chartTitle} onChange={(e) => onChangeBaseMap({ chartTitle: e.target.value })} className="w-full px-2.5 py-1.5 text-xs border border-slate-200 rounded focus:outline-none focus:border-sky-500" />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-500 mb-1">日時表記</label>
+                  <input type="text" value={baseMap.chartDateText} onChange={(e) => onChangeBaseMap({ chartDateText: e.target.value })} className="w-full px-2.5 py-1.5 text-xs font-mono-tabular border border-slate-200 rounded focus:outline-none focus:border-sky-500" />
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="flex-1 overflow-y-auto divide-y divide-slate-200">
+          <div className="p-4 space-y-3">
+            <h2 className="text-xs font-semibold text-slate-900">スナップショット保存（ブラウザ保存）</h2>
+            <form onSubmit={handleCreateSnapshot} className="flex gap-1.5">
+              <input type="text" value={snapshotNameInput} onChange={(e) => setSnapshotNameInput(e.target.value)} placeholder="履歴名（省略可）" className="flex-1 min-w-0 px-2.5 py-1.5 text-xs border border-slate-200 rounded focus:outline-none focus:border-sky-500" />
+              <button type="submit" className="flex items-center gap-1 px-2.5 py-1.5 bg-sky-700 hover:bg-sky-800 text-white text-xs font-semibold rounded transition-colors whitespace-nowrap shrink-0">
+                <UiIcon name="bookmarkPlus" className="w-3.5 h-3.5" /><span>保存</span>
+              </button>
+            </form>
+
+            {snapshots.length === 0 ? (
+              <p className="text-xs text-slate-500 py-2 leading-relaxed">
+                保存されたスナップショットはまだありません。編集途中の状態を保存すると、いつでも後から復元できます。
+              </p>
+            ) : (
+              <div className="space-y-2.5">
+                {snapshots.map((snap) => {
+                  const totalItems = snap.state.layers.reduce((sum, l) => sum + l.items.length, 0);
+                  return (
+                    <div key={snap.id} className="border border-slate-200 rounded-md overflow-hidden bg-white">
+                      <div className="flex gap-2.5 p-2">
+                        {snap.thumbnailDataUrl ? (
+                          <img src={snap.thumbnailDataUrl} alt={snap.name} className="w-20 h-[60px] object-cover rounded border border-slate-200 shrink-0 bg-slate-100" />
+                        ) : (
+                          <div className="w-20 h-[60px] rounded border border-slate-200 bg-slate-100 shrink-0" />
+                        )}
+                        <div className="flex-1 min-w-0 flex flex-col justify-between">
+                          <div>
+                            <div className="text-xs font-semibold text-slate-800 truncate">{snap.name}</div>
+                            <div className="text-[11px] font-mono-tabular text-slate-500 mt-0.5">{formatShortDate(snap.createdAt)} · {totalItems}要素</div>
+                          </div>
+                          <div className="flex items-center gap-1.5 mt-1.5">
+                            <button type="button" onClick={() => onRestoreSnapshot(snap)} className="flex items-center gap-1 px-2 py-1 text-[11px] font-semibold text-sky-700 bg-sky-50 hover:bg-sky-100 rounded border border-sky-200 transition-colors">
+                              <UiIcon name="rotateCcw" className="w-3 h-3" /><span>復元</span>
+                            </button>
+                            <button type="button" onClick={() => onDeleteSnapshot(snap.id)} className="p-1 text-slate-400 hover:text-rose-600 rounded transition-colors" title="削除">
+                              <UiIcon name="trash" className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          <div className="p-4 space-y-2.5">
+            <div className="flex items-center justify-between">
+              <h2 className="text-xs font-semibold text-slate-900">操作履歴タイムライン</h2>
+              <span className="text-[11px] font-mono-tabular text-slate-400">{historyIndex + 1} / {history.length}</span>
+            </div>
+            <p className="text-[11px] text-slate-500">クリックするとその時点の編集内容に戻せます。</p>
+            <div className="space-y-1 max-h-72 overflow-y-auto pr-1">
+              {[...history].map((entry, idx) => ({ entry, idx })).reverse().map(({ entry, idx }) => {
+                const isCurrent = idx === historyIndex;
+                const isFuture = idx > historyIndex;
+                return (
+                  <button
+                    key={entry.id} type="button" onClick={() => onJumpToHistory(idx)}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded text-left text-xs border transition-colors ${
+                      isCurrent ? 'bg-sky-50 border-sky-300 text-sky-900 font-semibold'
+                        : isFuture ? 'bg-slate-50 border-slate-100 text-slate-400 hover:bg-slate-100'
+                        : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                    }`}
+                  >
+                    <span className="truncate">{entry.label}</span>
+                    <span className="text-[11px] font-mono-tabular shrink-0 ml-2 opacity-75">{formatTime(entry.timestamp)}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+    </aside>
+  );
+};
+
+// === 9. ExportModal ===
+const ExportModal = ({ isOpen, onClose, documentState }) => {
+  const previewCanvasRef = useRef(null);
+  const [scaleFactor, setScaleFactor] = useState(2);
+  const [format, setFormat] = useState('png');
+  const [filename, setFilename] = useState(() => {
+    const d = new Date();
+    return `tenkizu-${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+  });
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!isOpen || !previewCanvasRef.current) return;
+    const canvas = previewCanvasRef.current;
+    canvas.width = 640;
+    canvas.height = 480;
+    const ctx = canvas.getContext('2d');
+    if (ctx) renderWeatherChart(ctx, documentState, { scale: 640 / CHART_WIDTH });
+  }, [isOpen, documentState]);
+
+  if (!isOpen) return null;
+
+  const buildExportCanvas = () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = CHART_WIDTH * scaleFactor;
+    canvas.height = CHART_HEIGHT * scaleFactor;
+    const ctx = canvas.getContext('2d');
+    if (ctx) renderWeatherChart(ctx, documentState, { scale: scaleFactor });
+    return canvas;
+  };
+
+  const handleDownload = () => {
+    const canvas = buildExportCanvas();
+    const mime = format === 'png' ? 'image/png' : 'image/jpeg';
+    const link = document.createElement('a');
+    const cleanName = (filename.trim() || 'weather-chart').replace(/\.(png|jpg|jpeg)$/i, '');
+    link.download = `${cleanName}.${format === 'png' ? 'png' : 'jpg'}`;
+    link.href = canvas.toDataURL(mime, 0.94);
+    link.click();
+    onClose();
+  };
+
+  const handleCopyClipboard = async () => {
+    try {
+      const canvas = buildExportCanvas();
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+      if (blob && navigator.clipboard && 'write' in navigator.clipboard) {
+        await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      }
+    } catch {}
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+      <div className="bg-white border border-slate-200 rounded-xl shadow-xl w-full max-w-2xl overflow-hidden">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200">
+          <h2 className="text-base font-bold text-slate-900">天気図を画像として保存</h2>
+          <button type="button" onClick={onClose} className="p-1.5 rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-900 transition-colors" aria-label="閉じる">
+            <UiIcon name="x" />
+          </button>
+        </div>
+        <div className="p-5 grid grid-cols-1 md:grid-cols-12 gap-5 items-start">
+          <div className="md:col-span-7">
+            <div className="border border-slate-200 rounded-lg overflow-hidden bg-slate-100">
+              <canvas ref={previewCanvasRef} className="w-full h-auto block" />
+            </div>
+            <div className="mt-2 text-xs text-slate-500 font-mono-tabular">
+              出力サイズ: {CHART_WIDTH * scaleFactor} × {CHART_HEIGHT * scaleFactor} px
+            </div>
+          </div>
+          <div className="md:col-span-5 space-y-4">
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1.5">ファイル名</label>
+              <input type="text" value={filename} onChange={(e) => setFilename(e.target.value)} className="w-full px-3 py-2 text-sm font-mono-tabular border border-slate-200 rounded-md focus:outline-none focus:border-sky-500" />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1.5">画像形式</label>
+              <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-md">
+                <button type="button" onClick={() => setFormat('png')} className={`py-1.5 text-xs font-semibold rounded transition-colors ${format === 'png' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'}`}>PNG (推奨)</button>
+                <button type="button" onClick={() => setFormat('jpeg')} className={`py-1.5 text-xs font-semibold rounded transition-colors ${format === 'jpeg' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'}`}>JPEG</button>
+              </div>
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1.5">解像度</label>
+              <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-md">
+                <button type="button" onClick={() => setScaleFactor(1)} className={`py-1.5 text-xs font-medium rounded transition-colors ${scaleFactor === 1 ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'}`}>標準 (1200×900)</button>
+                <button type="button" onClick={() => setScaleFactor(2)} className={`py-1.5 text-xs font-medium rounded transition-colors ${scaleFactor === 2 ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'}`}>高精細 (2400×1800)</button>
+              </div>
+            </div>
+            <div className="pt-2 space-y-2">
+              <button type="button" onClick={handleDownload} className="w-full flex items-center justify-center gap-2 py-2.5 px-4 bg-sky-700 hover:bg-sky-800 text-white text-sm font-semibold rounded-lg transition-colors">
+                <UiIcon name="download" /><span>画像をダウンロード</span>
+              </button>
+              <button type="button" onClick={handleCopyClipboard} className="w-full flex items-center justify-center gap-2 py-2 px-4 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-semibold rounded-lg transition-colors">
+                {copied ? <><UiIcon name="check" className="w-4 h-4 text-emerald-600" /><span className="text-emerald-700">コピーしました</span></> : <><UiIcon name="copy" /><span>クリップボードにコピー</span></>}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// === 10. Main App ===
+const STORAGE_DOC_KEY = 'tenkizu_studio_active_doc_v1';
+const STORAGE_SNAPSHOTS_KEY = 'tenkizu_studio_snapshots_v1';
+const STORAGE_HISTORY_KEY = 'tenkizu_studio_history_v1';
+const MAX_HISTORY_LENGTH = 50;
+
+function cloneDoc(doc) { return JSON.parse(JSON.stringify(doc)); }
+function makeHistoryEntry(label, state) {
+  return { id: `hist_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`, label, timestamp: Date.now(), state: cloneDoc(state) };
+}
+function migratePressureColors(doc) {
+  return {
+    ...doc,
+    layers: doc.layers.map((layer) => ({
+      ...layer,
+      items: layer.items.map((item) => {
+        if (item.itemType !== 'stamp') return item;
+        if (item.kind === 'high' && item.color === '#DC2626') return { ...item, color: '#2563EB' };
+        if (item.kind === 'low' && item.color === '#2563EB') return { ...item, color: '#DC2626' };
+        return item;
+      }),
+    })),
+  };
+}
+function loadInitialDocument() {
+  try {
+    const raw = localStorage.getItem(STORAGE_DOC_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && Array.isArray(parsed.layers) && parsed.layers.length > 0) return migratePressureColors(parsed);
+    }
+  } catch {}
+  return CHART_PRESETS[1].create();
+}
+function loadInitialHistory(fallbackDoc) {
+  try {
+    const raw = localStorage.getItem(STORAGE_HISTORY_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && Array.isArray(parsed.entries) && parsed.entries.length > 0) {
+        return {
+          entries: parsed.entries.map((e) => ({ ...e, state: migratePressureColors(e.state) })),
+          index: Math.max(0, Math.min(parsed.entries.length - 1, parsed.index ?? 0)),
+        };
+      }
+    }
+  } catch {}
+  return { entries: [makeHistoryEntry('初期状態', fallbackDoc)], index: 0 };
+}
+function loadInitialSnapshots() {
+  try {
+    const raw = localStorage.getItem(STORAGE_SNAPSHOTS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {}
+  return [];
+}
+
+function App() {
+  const initialDoc = useMemo(() => loadInitialDocument(), []);
+  const initialHist = useMemo(() => loadInitialHistory(initialDoc), [initialDoc]);
+
+  const [documentState, setDocumentState] = useState(() => initialHist.entries[initialHist.index]?.state ?? initialDoc);
+  const [history, setHistory] = useState(initialHist.entries);
+  const [historyIndex, setHistoryIndex] = useState(initialHist.index);
+  const [snapshots, setSnapshots] = useState(loadInitialSnapshots);
+  const [activeTool, setActiveTool] = useState('isobar');
+  const [selectedItemId, setSelectedItemId] = useState(null);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [toastMessage, setToastMessage] = useState(null);
+  const [mapVersion, setMapVersion] = useState(0);
+
+  const [settings, setSettings] = useState({
+    strokeWidth: 2.0, lineStyle: 'solid', isobarPressure: '1012', showIsobarLabel: true,
+    flipFrontSide: false, symbolSpacing: 32, symbolSize: 8, penColor: '#0F172A',
+    stampLabelStyle: 'ja', stampPressure: '1008', stampMovement: '', stampScale: 1.0,
+    weatherCaption: '', textValue: '寒冷渦', textColor: '#0F172A', eraserRadius: 16,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-50m.json')
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error('Map fetch failed'))))
+      .then((topology) => {
+        if (cancelled) return;
+        const geom = buildGeometryFromTopology(topology);
+        if (geom && geom.landRings.length > 0) {
+          cachedGeometry = geom;
+          setMapVersion((v) => v + 1);
+        }
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  const showToast = useCallback((msg) => setToastMessage(msg), []);
+  useEffect(() => {
+    if (!toastMessage) return;
+    const t = setTimeout(() => setToastMessage(null), 2600);
+    return () => clearTimeout(t);
+  }, [toastMessage]);
+
+  useEffect(() => {
+    try { localStorage.setItem(STORAGE_DOC_KEY, JSON.stringify(documentState)); } catch {}
+  }, [documentState]);
+  useEffect(() => {
+    try { localStorage.setItem(STORAGE_HISTORY_KEY, JSON.stringify({ entries: history.slice(-30), index: Math.min(historyIndex, 29) })); } catch {}
+  }, [history, historyIndex]);
+  useEffect(() => {
+    try { localStorage.setItem(STORAGE_SNAPSHOTS_KEY, JSON.stringify(snapshots)); } catch {}
+  }, [snapshots]);
+
+  const commitDocumentChange = useCallback((nextState, historyLabel) => {
+    const cloned = cloneDoc(nextState);
+    setDocumentState(cloned);
+    const updated = [...history.slice(0, historyIndex + 1), makeHistoryEntry(historyLabel, cloned)];
+    if (updated.length > MAX_HISTORY_LENGTH) {
+      setHistory(updated.slice(updated.length - MAX_HISTORY_LENGTH));
+      setHistoryIndex(MAX_HISTORY_LENGTH - 1);
+    } else {
+      setHistory(updated);
+      setHistoryIndex(updated.length - 1);
+    }
+  }, [history, historyIndex]);
+
+  useEffect(() => {
+    if (historyIndex >= history.length) setHistoryIndex(Math.max(0, history.length - 1));
+  }, [history.length, historyIndex]);
+
+  const handleUndo = useCallback(() => {
+    if (historyIndex <= 0) return;
+    const entry = history[historyIndex - 1];
+    if (entry) {
+      setHistoryIndex(historyIndex - 1);
+      setDocumentState(cloneDoc(entry.state));
+      setSelectedItemId(null);
+    }
+  }, [history, historyIndex]);
+
+  const handleRedo = useCallback(() => {
+    if (historyIndex >= history.length - 1) return;
+    const entry = history[historyIndex + 1];
+    if (entry) {
+      setHistoryIndex(historyIndex + 1);
+      setDocumentState(cloneDoc(entry.state));
+      setSelectedItemId(null);
+    }
+  }, [history, historyIndex]);
+
+  const handleJumpToHistory = useCallback((idx) => {
+    const entry = history[idx];
+    if (!entry) return;
+    setHistoryIndex(idx);
+    setDocumentState(cloneDoc(entry.state));
+    setSelectedItemId(null);
+    showToast(`「${entry.label}」の時点に復元しました`);
+  }, [history, showToast]);
+
+  const selectedItem = useMemo(() => {
+    if (!selectedItemId) return null;
+    for (const layer of documentState.layers) {
+      const found = layer.items.find((i) => i.id === selectedItemId);
+      if (found) return found;
+    }
+    return null;
+  }, [documentState.layers, selectedItemId]);
+
+  const handleDeleteSelectedItem = useCallback(() => {
+    if (!selectedItemId) return;
+    const nextState = {
+      ...documentState,
+      layers: documentState.layers.map((l) => ({ ...l, items: l.items.filter((i) => i.id !== selectedItemId) })),
+    };
+    setSelectedItemId(null);
+    commitDocumentChange(nextState, '選択要素を削除');
+  }, [selectedItemId, documentState, commitDocumentChange]);
+
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) handleRedo(); else handleUndo();
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'y') {
+        e.preventDefault();
+        handleRedo();
+        return;
+      }
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedItemId) {
+        e.preventDefault();
+        handleDeleteSelectedItem();
+        return;
+      }
+      if (!e.metaKey && !e.ctrlKey && !e.altKey) {
+        const k = e.key.toLowerCase();
+        if (k === 'v') setActiveTool('select');
+        if (k === 'e') setActiveTool('eraser');
+        if (k === 'i') setActiveTool('isobar');
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [handleUndo, handleRedo, selectedItemId, handleDeleteSelectedItem]);
+
+  const handleAddItem = useCallback((item, historyLabel) => {
+    const nextState = {
+      ...documentState,
+      layers: documentState.layers.map((layer) =>
+        layer.id === documentState.activeLayerId ? { ...layer, items: [...layer.items, item] } : layer
+      ),
+    };
+    commitDocumentChange(nextState, historyLabel);
+  }, [documentState, commitDocumentChange]);
+
+  const handleEraseItems = useCallback((itemIds) => {
+    if (itemIds.length === 0) return;
+    const idSet = new Set(itemIds);
+    const nextState = {
+      ...documentState,
+      layers: documentState.layers.map((layer) =>
+        layer.visible && !layer.locked ? { ...layer, items: layer.items.filter((i) => !idSet.has(i.id)) } : layer
+      ),
+    };
+    if (selectedItemId && idSet.has(selectedItemId)) setSelectedItemId(null);
+    commitDocumentChange(nextState, '消しゴムで削除');
+  }, [documentState, selectedItemId, commitDocumentChange]);
+
+  const handleMoveItemFinish = useCallback((itemId, dx, dy) => {
+    const nextState = {
+      ...documentState,
+      layers: documentState.layers.map((layer) => ({
+        ...layer,
+        items: layer.items.map((item) => {
+          if (item.id !== itemId) return item;
+          if (item.itemType === 'stamp') return { ...item, x: item.x + dx, y: item.y + dy };
+          return { ...item, points: item.points.map((p) => ({ x: p.x + dx, y: p.y + dy })) };
+        }),
+      })),
+    };
+    commitDocumentChange(nextState, '要素を移動');
+  }, [documentState, commitDocumentChange]);
+
+  const handleUpdateSelectedItem = useCallback((updater) => {
+    if (!selectedItemId) return;
+    const nextState = {
+      ...documentState,
+      layers: documentState.layers.map((layer) => ({
+        ...layer,
+        items: layer.items.map((item) => (item.id === selectedItemId ? updater(item) : item)),
+      })),
+    };
+    commitDocumentChange(nextState, '要素のプロパティを変更');
+  }, [selectedItemId, documentState, commitDocumentChange]);
+
+  const handleSelectItem = useCallback((id, layerId) => {
+    setSelectedItemId(id);
+    if (id && layerId) setDocumentState((prev) => ({ ...prev, activeLayerId: layerId }));
+  }, []);
+
+  const handleAddLayer = () => {
+    const newLayer = {
+      id: `layer_${Date.now().toString(36)}`,
+      name: `レイヤー ${documentState.layers.length + 1}`,
+      visible: true, locked: false, opacity: 1, items: [],
+    };
+    commitDocumentChange({ ...documentState, layers: [...documentState.layers, newLayer], activeLayerId: newLayer.id }, `レイヤー「${newLayer.name}」を追加`);
+  };
+
+  const handleDeleteLayer = (id) => {
+    if (documentState.layers.length <= 1) return;
+    const target = documentState.layers.find((l) => l.id === id);
+    const remaining = documentState.layers.filter((l) => l.id !== id);
+    const nextActive = documentState.activeLayerId === id ? remaining[remaining.length - 1].id : documentState.activeLayerId;
+    setSelectedItemId(null);
+    commitDocumentChange({ ...documentState, layers: remaining, activeLayerId: nextActive }, `レイヤー「${target?.name ?? ''}」を削除`);
+  };
+
+  const handleRenameLayer = (id, name) => {
+    commitDocumentChange(
+      { ...documentState, layers: documentState.layers.map((l) => (l.id === id ? { ...l, name } : l)) },
+      `レイヤー名を「${name}」に変更`
+    );
+  };
+
+  const handleToggleLayerVisibility = (id) => {
+    const target = documentState.layers.find((l) => l.id === id);
+    commitDocumentChange(
+      { ...documentState, layers: documentState.layers.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l)) },
+      `レイヤー「${target?.name ?? ''}」を${target?.visible ? '非表示' : '表示'}`
+    );
+  };
+
+  const handleToggleLayerLock = (id) => {
+    setDocumentState((prev) => ({ ...prev, layers: prev.layers.map((l) => (l.id === id ? { ...l, locked: !l.locked } : l)) }));
+  };
+
+  const handleChangeLayerOpacity = (id, opacity) => {
+    setDocumentState((prev) => ({ ...prev, layers: prev.layers.map((l) => (l.id === id ? { ...l, opacity } : l)) }));
+  };
+
+  const handleMoveLayer = (id, direction) => {
+    const idx = documentState.layers.findIndex((l) => l.id === id);
+    if (idx === -1) return;
+    const swapIdx = direction === 'up' ? idx + 1 : idx - 1;
+    if (swapIdx < 0 || swapIdx >= documentState.layers.length) return;
+    const reordered = [...documentState.layers];
+    const [removed] = reordered.splice(idx, 1);
+    reordered.splice(swapIdx, 0, removed);
+    commitDocumentChange({ ...documentState, layers: reordered }, `レイヤー「${removed.name}」の順序を変更`);
+  };
+
+  const handleUnlockOrShowActiveLayer = () => {
+    setDocumentState((prev) => ({
+      ...prev,
+      layers: prev.layers.map((l) => (l.id === prev.activeLayerId ? { ...l, visible: true, locked: false } : l)),
+    }));
+  };
+
+  const handleChangeBaseMap = (patch) => {
+    setDocumentState((prev) => ({ ...prev, baseMap: { ...prev.baseMap, ...patch } }));
+  };
+
+  const handleLoadPreset = (preset) => {
+    setSelectedItemId(null);
+    commitDocumentChange(preset.create(), `テンプレート「${preset.name}」を読み込み`);
+    showToast(`テンプレート「${preset.name}」を読み込みました`);
+  };
+
+  const handleClearCanvas = () => {
+    const blank = createBlankDocument();
+    blank.baseMap = { ...documentState.baseMap };
+    setSelectedItemId(null);
+    commitDocumentChange(blank, 'キャンバスを白紙にリセット');
+    showToast('すべての描画をクリアしました');
+  };
+
+  const handleSaveSnapshot = (customName) => {
+    const thumb = generateSnapshotThumbnail(documentState);
+    const now = new Date();
+    const defaultName = `${documentState.baseMap.chartTitle || '天気図'} (${now.getHours()}:${String(now.getMinutes()).padStart(2, '0')})`;
+    const snap = {
+      id: `snap_${Date.now().toString(36)}`,
+      name: customName && customName.trim() ? customName.trim() : defaultName,
+      createdAt: Date.now(), thumbnailDataUrl: thumb, state: cloneDoc(documentState),
+    };
+    setSnapshots((prev) => [snap, ...prev].slice(0, 24));
+    showToast(`履歴「${snap.name}」を保存しました`);
+  };
+
+  const handleRestoreSnapshot = (snap) => {
+    setSelectedItemId(null);
+    commitDocumentChange(cloneDoc(snap.state), `スナップショット「${snap.name}」を復元`);
+    showToast(`「${snap.name}」を復元しました`);
+  };
+
+  const handleDeleteSnapshot = (id) => {
+    setSnapshots((prev) => prev.filter((s) => s.id !== id));
+  };
+
+  return (
+    <div className="h-screen w-screen flex flex-col bg-slate-50 text-slate-900 overflow-hidden">
+      <TopBar
+        canUndo={historyIndex > 0} canRedo={historyIndex < history.length - 1}
+        onUndo={handleUndo} onRedo={handleRedo}
+        onSaveSnapshot={() => handleSaveSnapshot()}
+        onLoadPreset={handleLoadPreset} onClearCanvas={handleClearCanvas}
+        onOpenExport={() => setExportOpen(true)}
+      />
+      <main className="flex-1 flex min-h-0 overflow-hidden">
+        <ToolSidebar
+          activeTool={activeTool}
+          onSelectTool={(t) => { setActiveTool(t); if (t !== 'select') setSelectedItemId(null); }}
+          settings={settings} onChangeSettings={(patch) => setSettings((prev) => ({ ...prev, ...patch }))}
+          selectedItem={selectedItem} onUpdateSelectedItem={handleUpdateSelectedItem}
+          onDeleteSelectedItem={handleDeleteSelectedItem}
+        />
+        <WeatherCanvas
+          documentState={documentState} activeTool={activeTool} settings={settings}
+          selectedItemId={selectedItemId} mapVersion={mapVersion}
+          onSelectItem={handleSelectItem} onAddItem={handleAddItem}
+          onEraseItems={handleEraseItems} onMoveItemFinish={handleMoveItemFinish}
+          onUnlockOrShowActiveLayer={handleUnlockOrShowActiveLayer}
+        />
+        <RightPanel
+          layers={documentState.layers} activeLayerId={documentState.activeLayerId}
+          baseMap={documentState.baseMap} history={history} historyIndex={historyIndex} snapshots={snapshots}
+          onSelectLayer={(id) => setDocumentState((prev) => ({ ...prev, activeLayerId: id }))}
+          onAddLayer={handleAddLayer} onDeleteLayer={handleDeleteLayer}
+          onRenameLayer={handleRenameLayer} onToggleLayerVisibility={handleToggleLayerVisibility}
+          onToggleLayerLock={handleToggleLayerLock} onChangeLayerOpacity={handleChangeLayerOpacity}
+          onMoveLayer={handleMoveLayer} onChangeBaseMap={handleChangeBaseMap}
+          onJumpToHistory={handleJumpToHistory} onSaveNamedSnapshot={(name) => handleSaveSnapshot(name)}
+          onRestoreSnapshot={handleRestoreSnapshot} onDeleteSnapshot={handleDeleteSnapshot}
+        />
+      </main>
+      <ExportModal isOpen={exportOpen} onClose={() => setExportOpen(false)} documentState={documentState} />
+      {toastMessage && (
+        <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-50 px-4 py-2 bg-slate-900 text-white text-xs font-medium rounded-lg shadow-lg pointer-events-none">
+          {toastMessage}
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+  </body>
+</html>
